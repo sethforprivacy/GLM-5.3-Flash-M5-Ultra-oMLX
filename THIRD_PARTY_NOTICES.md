@@ -13,6 +13,12 @@ Files changed by the patch (every change is marked in-code with a "Phase-2" / "p
 - `omlx/patches/p2_lookup.py` (new): prompt-lookup drafts.
 - `omlx/patches/p2_kda_fused.py` (new): single-dispatch KDA Metal kernel.
 
+## Upstream oMLX pull requests (Apache-2.0)
+
+`patches/upstream-omlx-prs-3985-3986-3988.patch` is the unmodified combined diff of three open oMLX pull requests by jonathan308, as merged onto f0d8428a:
+[#3985](https://github.com/jundot/omlx/pull/3985) @ c5413b9a, [#3986](https://github.com/jundot/omlx/pull/3986) @ 8ac5aa9a and [#3988](https://github.com/jundot/omlx/pull/3988) @ d73f689d.
+They are contributions to oMLX under its Apache-2.0 license and are redistributed here unchanged.
+
 ## Ideas credited, no code copied
 
 - [mlx-serve](https://github.com/ddalcu/mlx-serve) (MIT): prompt-lookup-aware MTP (#523, #533) and single-dispatch GDN decode (#517). The implementations here are independent.

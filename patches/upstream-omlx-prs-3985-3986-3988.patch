@@ -1,0 +1,1518 @@
+diff --git a/omlx/patches/glm_moe_dsa/indexer_nax.py b/omlx/patches/glm_moe_dsa/indexer_nax.py
+new file mode 100644
+index 00000000..11dde97e
+--- /dev/null
++++ b/omlx/patches/glm_moe_dsa/indexer_nax.py
+@@ -0,0 +1,254 @@
++"""Tensor-unit (NAX) DSA indexer scores for GLM-5.3 prefill.
++
++The GLM-5.3 lightning indexer scores every query against every pooled key:
++
++    score[s, p] = sum_h relu(q[s, h] . k[p]) * w[s, h]      (32 heads x 128)
++
++The native ``dsa_indexer_scores`` kernel runs this on the classic SIMD
++matrix units, reloading each key tile once per head, at ~13 TFLOPS; its
++cost grows with the context (O(L x P)) and is a main part of GLM's
++long-context prefill taper. This module runs the same math on the M5
++tensor units: per 32x32 output block a simdgroup computes each head's
++[32 x 128] x [128 x 32] product with NAX matmuls (fp32 accumulation),
++applies relu and the head weight in fp32 in head order, and writes the
++bf16 score once, with the pooled causal mask folded into the epilogue
++(masked -> bf16(-1e30), exactly what the call site's ``mx.where`` wrote).
++Blocks that are entirely masked skip the matmuls.
++
++Only the fp32 summation order of each 128-wide dot product differs from
++the native kernel, so scores agree to bf16 rounding (a few ulp at most),
++and top-k selection can only differ at exact near-ties.
++"""
++
++from __future__ import annotations
++
++import os
++from functools import lru_cache
++from typing import Optional
++
++import mlx.core as mx
++
++_ENV = os.environ.get("OMLX_GLM_DSA_INDEXER_NAX", "1").strip().lower()
++_ENABLED = _ENV not in {"0", "false", "off"}
++
++# Rows per call: bounds the [rows, P] bf16 score buffer (256 MiB).
++_MAX_SCORE_ELEMENTS = 1 << 27
++
++_HEAD_DIM = 128
++
++_HEADER = """
++#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
++using namespace mpp::tensor_ops;
++"""
++
++# One simdgroup owns a 32 (queries) x 32 (pooled keys) output block as 2x2
++# 16x16 fragments in the MLX NAX fragment layout: lane -> rows fm, fm + 8
++# and columns fn .. fn + 3 of each fragment.
++_SOURCE = """
++    constexpr int D = 128;
++    const int S = params[0];
++    const int P = params[1];
++    const int before = params[2];
++    const int pool_len = params[3];
++    const int ratio = params[4];
++    const int H = params[5];
++    const int q_row_stride = H * D;
++    const uint sg = simdgroup_index_in_threadgroup;
++    const uint lane = thread_index_in_simdgroup;
++    const int sm = int(threadgroup_position_in_grid.y) * (32 * WM) + int(sg / WN) * 32;
++    const int sn = int(threadgroup_position_in_grid.x) * (32 * WN) + int(sg % WN) * 32;
++
++    const short qid = short(lane >> 2);
++    const short fm = short((qid & 4) | ((lane >> 1) & 3));
++    const short fn = short(((qid & 2) | (lane & 1)) * 4);
++
++    // Every score of the block is masked when its first pooled key is not
++    // yet complete for the block's last query row.
++    const int s_last = min(sm + 31, S - 1);
++    const bool live = sm < S && sn < P && sn < pool_len &&
++        (sn + 1) * ratio - 1 <= before + s_last;
++
++    float acc[2][16];
++    for (short a = 0; a < 2; ++a) {
++        for (short e = 0; e < 16; ++e) {
++            acc[a][e] = 0.0f;
++        }
++    }
++
++    int qrow[2][2];
++    for (short tm = 0; tm < 2; ++tm) {
++        for (short i = 0; i < 2; ++i) {
++            qrow[tm][i] = min(sm + tm * 16 + fm + i * 8, S - 1);
++        }
++    }
++
++    if (live) {
++        constexpr auto desc = matmul2d_descriptor(
++            16, 32, 16, false, true, true,
++            matmul2d_descriptor::mode::multiply_accumulate);
++        matmul2d<desc, execution_simdgroup> op;
++
++        int krow[2][2];
++        for (short tn = 0; tn < 2; ++tn) {
++            for (short i = 0; i < 2; ++i) {
++                krow[tn][i] = min(sn + tn * 16 + fm + i * 8, P - 1);
++            }
++        }
++        const device T* kbase[2][2];
++        for (short tn = 0; tn < 2; ++tn) {
++            for (short i = 0; i < 2; ++i) {
++                kbase[tn][i] = k + ulong(krow[tn][i]) * D + fn;
++            }
++        }
++
++        for (int h = 0; h < H; ++h) {
++            auto ct_a0 = op.template get_left_input_cooperative_tensor<T, T, float>();
++            auto ct_a1 = op.template get_left_input_cooperative_tensor<T, T, float>();
++            auto ct_b = op.template get_right_input_cooperative_tensor<T, T, float>();
++            auto c0 = op.template get_destination_cooperative_tensor<
++                metal::remove_addrspace_t<decltype(ct_a0)>,
++                metal::remove_addrspace_t<decltype(ct_b)>, float>();
++            auto c1 = op.template get_destination_cooperative_tensor<
++                metal::remove_addrspace_t<decltype(ct_a0)>,
++                metal::remove_addrspace_t<decltype(ct_b)>, float>();
++            for (short e = 0; e < 16; ++e) {
++                c0[e] = 0.0f;
++                c1[e] = 0.0f;
++            }
++            const device T* a00 = q + ulong(qrow[0][0]) * q_row_stride + h * D + fn;
++            const device T* a01 = q + ulong(qrow[0][1]) * q_row_stride + h * D + fn;
++            const device T* a10 = q + ulong(qrow[1][0]) * q_row_stride + h * D + fn;
++            const device T* a11 = q + ulong(qrow[1][1]) * q_row_stride + h * D + fn;
++            for (short kk = 0; kk < D; kk += 16) {
++                for (short j = 0; j < 4; ++j) {
++                    ct_a0[j] = a00[kk + j];
++                    ct_a0[4 + j] = a01[kk + j];
++                    ct_a1[j] = a10[kk + j];
++                    ct_a1[4 + j] = a11[kk + j];
++                }
++                for (short tn = 0; tn < 2; ++tn) {
++                    for (short i = 0; i < 2; ++i) {
++                        for (short j = 0; j < 4; ++j) {
++                            ct_b[tn * 8 + i * 4 + j] = kbase[tn][i][kk + j];
++                        }
++                    }
++                }
++                op.run(ct_a0, ct_b, c0);
++                op.run(ct_a1, ct_b, c1);
++            }
++            // relu * head weight in fp32, heads accumulated in order.
++            for (short i = 0; i < 2; ++i) {
++                const float w0 = float(w[ulong(qrow[0][i]) * H + h]);
++                const float w1 = float(w[ulong(qrow[1][i]) * H + h]);
++                for (short tn = 0; tn < 2; ++tn) {
++                    for (short j = 0; j < 4; ++j) {
++                        const short e = tn * 8 + i * 4 + j;
++                        acc[0][e] += max(float(c0[e]), 0.0f) * w0;
++                        acc[1][e] += max(float(c1[e]), 0.0f) * w1;
++                    }
++                }
++            }
++        }
++    }
++
++    const T masked = T(-1e30f);
++    for (short tm = 0; tm < 2; ++tm) {
++        for (short i = 0; i < 2; ++i) {
++            const int s = sm + tm * 16 + fm + i * 8;
++            if (s >= S) {
++                continue;
++            }
++            for (short tn = 0; tn < 2; ++tn) {
++                for (short j = 0; j < 4; ++j) {
++                    const int p = sn + tn * 16 + fn + j;
++                    if (p >= P) {
++                        continue;
++                    }
++                    const bool valid = p < pool_len && (p + 1) * ratio - 1 <= before + s;
++                    out[ulong(s) * P + p] = valid ? T(acc[tm][tn * 8 + i * 4 + j]) : masked;
++                }
++            }
++        }
++    }
++"""
++
++_KERNEL = None
++_WM = 2
++_WN = 2
++
++
++def _kernel():
++    global _KERNEL
++    if _KERNEL is None:
++        _KERNEL = mx.fast.metal_kernel(
++            name="omlx_glm_dsa_indexer_scores_nax",
++            input_names=["q", "k", "w", "params"],
++            output_names=["out"],
++            header=_HEADER,
++            source=_SOURCE,
++        )
++    return _KERNEL
++
++
++@lru_cache(maxsize=1)
++def nax_indexer_available() -> bool:
++    if not _ENABLED:
++        return False
++    try:
++        from omlx.custom_kernels.nax import is_nax_available
++
++        return bool(is_nax_available())
++    except Exception:  # noqa: BLE001
++        return False
++
++
++def max_rows_per_call(pool_width: int) -> int:
++    """Largest multiple of 64 query rows whose score buffer fits the cap."""
++    rows = _MAX_SCORE_ELEMENTS // max(int(pool_width), 1)
++    return max(64, (rows // 64) * 64)
++
++
++def indexer_scores_nax(
++    q: mx.array,
++    pool_keys: mx.array,
++    weights: mx.array,
++    before: int,
++    pool_len: int,
++    ratio: int,
++) -> Optional[mx.array]:
++    """Masked head-summed indexer scores on the tensor units.
++
++    q: [S, H, 128] (row-major), pool_keys: [P, 128], weights: [S, H] already
++    scaled, all bf16. Query row ``s`` sits at absolute position
++    ``before + s``; pooled key ``p`` is visible to it iff ``p < pool_len``
++    and ``(p + 1) * ratio - 1 <= before + s``. Returns [S, P] bf16 with
++    masked entries set to bf16(-1e30), or None for unsupported inputs.
++    """
++    if (
++        q.ndim != 3
++        or pool_keys.ndim != 2
++        or weights.ndim != 2
++        or q.shape[-1] != _HEAD_DIM
++        or pool_keys.shape[-1] != _HEAD_DIM
++        or weights.shape != q.shape[:2]
++        or q.dtype != mx.bfloat16
++        or pool_keys.dtype != mx.bfloat16
++        or weights.dtype != mx.bfloat16
++        or ratio < 1
++    ):
++        return None
++    S, H, _ = q.shape
++    P = pool_keys.shape[0]
++    if S == 0 or P == 0:
++        return None
++    params = mx.array([S, P, int(before), int(pool_len), int(ratio), H], dtype=mx.int32)
++    tg_x = (P + 32 * _WN - 1) // (32 * _WN)
++    tg_y = (S + 32 * _WM - 1) // (32 * _WM)
++    return _kernel()(
++        inputs=[q, pool_keys, weights, params],
++        template=[("T", mx.bfloat16), ("WM", _WM), ("WN", _WN)],
++        grid=(tg_x * _WM * _WN * 32, tg_y, 1),
++        threadgroup=(_WM * _WN * 32, 1, 1),
++        output_shapes=[(S, P)],
++        output_dtypes=[mx.bfloat16],
++    )[0]
+diff --git a/omlx/patches/glm_moe_dsa/sparse_mla_nax.py b/omlx/patches/glm_moe_dsa/sparse_mla_nax.py
+new file mode 100644
+index 00000000..6565a687
+--- /dev/null
++++ b/omlx/patches/glm_moe_dsa/sparse_mla_nax.py
+@@ -0,0 +1,340 @@
++"""Tensor-unit (NAX) sparse MLA prefill attention for GLM-5.3 on M5 GPUs.
++
++GLM-5.3's DSA layers attend every query over its own top-k latent rows
++(2048 + 3 tail slots, 64 heads, 512-wide NoPE latent; values are the same
++latent rows). The native ``glm_dsa_sparse_mla_attention`` kernel computes
++this in fp32 on the classic SIMD matrix units at ~10-13 TFLOPS: ~42-54 ms
++per layer per 2048-token chunk (4k-64k context, M5 Ultra).
++
++This kernel keeps the native kernel's arithmetic -- fp32 scores scaled by
++``scale * log2(e)``, unused slots excluded, online ``exp2`` softmax in
++fp32, fp32 probabilities times bf16 values accumulated in fp32, one
++division at the end -- but runs both products on the tensor units with
++fp32 accumulation, so only the summation order differs. The PV product
++is a non-relaxed fp32 x bf16 tensor op: with ``relaxed_precision`` the
++tensor unit would round the fp32 probabilities to ~11 significant bits
++(measured), which the native kernel does not do. Its operands use the
++fp32 fragment layout (see ``cb`` below). The bf16 x bf16 QK product is
++exact in either mode.
++
++Layout: one threadgroup per (query, 32-head half), 8 simdgroups. Per tile
++of 128 top-k slots, simdgroup ``(hg, kq)`` computes the scores of heads
++``hg * 16 .. + 16`` for slots ``kq * 32 .. + 32`` over the whole latent
++(key rows are read through the top-k indices, never gathered into memory)
++into threadgroup memory; then simdgroup ``(hg, dq)`` runs the online
++softmax of its head group over the tile and multiplies the fp32
++probabilities with its 128-wide value slice. Tiles without any usable slot
++(the indexer sorts unused slots last) are skipped.
++"""
++
++from __future__ import annotations
++
++import os
++from functools import lru_cache
++from typing import Optional
++
++import mlx.core as mx
++
++_ENV = os.environ.get("OMLX_GLM_SPARSE_MLA_NAX", "1").strip().lower()
++_ENABLED = _ENV not in {"0", "false", "off"}
++
++_D_LATENT = 512
++_HEADS_PER_GROUP = 32
++
++_HEADER = """
++#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
++using namespace mpp::tensor_ops;
++"""
++
++# Fragment layout (MLX BaseNAXFrag, 16x16): lane -> rows fm, fm + 8 and
++# columns fn .. fn + 3. Lanes sharing a row differ in lane bits 0 and 3.
++_SOURCE = """
++    constexpr int D = 512;
++    constexpr int BK = 128;
++    const int L = params[0];
++    const int Kn = params[1];
++    const int TOPK = params[2];
++    const int q_off = params[3];
++    const float scale_log2 = scale[0] * 1.44269504088896341f;
++    const int qi = int(threadgroup_position_in_grid.x);
++    const int hh = int(threadgroup_position_in_grid.y);
++    const uint sg = simdgroup_index_in_threadgroup;
++    const uint lane = thread_index_in_simdgroup;
++    const uint tid = sg * 32 + lane;
++    const int hg = int(sg) / 4;
++    const int dq = int(sg) % 4;   // QK: key quarter; PV: dim quarter
++    const int q_abs = q_off + qi;
++    const int head0 = hh * 32 + hg * 16;
++
++    const short qid = short(lane >> 2);
++    const short fm = short((qid & 4) | ((lane >> 1) & 3));
++    const short fn = short(((qid & 2) | (lane & 1)) * 4);
++    // fp32-operand layout of the PV product (relaxed_precision = false):
++    // left element i*4 + j -> row fm + 8i, col cb + {0, 1, 8, 9}[j];
++    // right/destination element i*8 + t*2 + u -> row fm + 8i, col cb + 8t + u.
++    const short cb = short(((qid & 2) | (lane & 1)) * 2);
++
++    threadgroup float s_tile[2 * 16 * BK];
++    threadgroup int sel[2][BK];
++    threadgroup int live[2][BK / 32];
++
++    constexpr auto qk_desc = matmul2d_descriptor(
++        16, 32, 16, false, true, true,
++        matmul2d_descriptor::mode::multiply_accumulate);
++    matmul2d<qk_desc, execution_simdgroup> qk_op;
++    // relaxed_precision must stay false here: with it the tensor unit rounds
++    // the fp32 probabilities to ~11 significant bits (the native kernel keeps
++    // them in fp32). bf16 x bf16 products are exact either way.
++    constexpr auto pv_desc = matmul2d_descriptor(
++        16, 32, 16, false, false, false,
++        matmul2d_descriptor::mode::multiply_accumulate);
++    matmul2d<pv_desc, execution_simdgroup> pv_op;
++
++    auto pa = pv_op.template get_left_input_cooperative_tensor<float, T, float>();
++    auto pb = pv_op.template get_right_input_cooperative_tensor<float, T, float>();
++    auto o0 = pv_op.template get_destination_cooperative_tensor<
++        metal::remove_addrspace_t<decltype(pa)>, metal::remove_addrspace_t<decltype(pb)>, float>();
++    auto o1 = pv_op.template get_destination_cooperative_tensor<
++        metal::remove_addrspace_t<decltype(pa)>, metal::remove_addrspace_t<decltype(pb)>, float>();
++    auto o2 = pv_op.template get_destination_cooperative_tensor<
++        metal::remove_addrspace_t<decltype(pa)>, metal::remove_addrspace_t<decltype(pb)>, float>();
++    auto o3 = pv_op.template get_destination_cooperative_tensor<
++        metal::remove_addrspace_t<decltype(pa)>, metal::remove_addrspace_t<decltype(pb)>, float>();
++    for (short e = 0; e < 16; ++e) {
++        o0[e] = 0.0f;
++        o1[e] = 0.0f;
++        o2[e] = 0.0f;
++        o3[e] = 0.0f;
++    }
++    float m_run[2] = {-FLT_MAX, -FLT_MAX};
++    float l_run[2] = {0.0f, 0.0f};
++
++    const device T* qr0 = q + (ulong(head0 + fm) * L + qi) * D + fn;
++    const device T* qr1 = q + (ulong(head0 + fm + 8) * L + qi) * D + fn;
++    const device int32_t* idx_row = idx + ulong(qi) * TOPK;
++
++    const int n_tiles = (TOPK + BK - 1) / BK;
++    for (int t = 0; t < n_tiles; ++t) {
++        const int buf = t & 1;
++        const int tile_keys = min(BK, TOPK - t * BK);
++        if (tid < uint(BK)) {
++            const int slot = t * BK + int(tid);
++            int kp = slot < TOPK ? int(idx_row[slot]) : -1;
++            if (kp < 0 || kp >= Kn || kp > q_abs) {
++                kp = -1;
++            }
++            sel[buf][tid] = kp;
++            const bool any_live = simd_any(kp >= 0);
++            if (lane == 0) {
++                live[buf][sg] = any_live ? 1 : 0;
++            }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        // Unused slots sort last in the indexer's top-k rows: skip tiles
++        // with no live key (uniform across the threadgroup).
++        if ((live[buf][0] | live[buf][1] | live[buf][2] | live[buf][3]) == 0) {
++            continue;
++        }
++
++        if (dq * 32 < tile_keys) {
++            auto qa = qk_op.template get_left_input_cooperative_tensor<T, T, float>();
++            auto kb = qk_op.template get_right_input_cooperative_tensor<T, T, float>();
++            auto sc = qk_op.template get_destination_cooperative_tensor<
++                metal::remove_addrspace_t<decltype(qa)>, metal::remove_addrspace_t<decltype(kb)>, float>();
++            for (short e = 0; e < 16; ++e) {
++                sc[e] = 0.0f;
++            }
++            const device T* kr[2][2];
++            for (short tn = 0; tn < 2; ++tn) {
++                for (short i = 0; i < 2; ++i) {
++                    const int kp = sel[buf][dq * 32 + tn * 16 + fm + i * 8];
++                    kr[tn][i] = kv + ulong(max(kp, 0)) * D + fn;
++                }
++            }
++            for (short kk = 0; kk < D; kk += 16) {
++                for (short j = 0; j < 4; ++j) {
++                    qa[j] = qr0[kk + j];
++                    qa[4 + j] = qr1[kk + j];
++                }
++                for (short tn = 0; tn < 2; ++tn) {
++                    for (short i = 0; i < 2; ++i) {
++                        for (short j = 0; j < 4; ++j) {
++                            kb[tn * 8 + i * 4 + j] = kr[tn][i][kk + j];
++                        }
++                    }
++                }
++                qk_op.run(qa, kb, sc);
++            }
++            threadgroup float* sp = s_tile + hg * 16 * BK + dq * 32;
++            for (short tn = 0; tn < 2; ++tn) {
++                for (short i = 0; i < 2; ++i) {
++                    for (short j = 0; j < 4; ++j) {
++                        sp[(fm + i * 8) * BK + tn * 16 + fn + j] = sc[tn * 8 + i * 4 + j];
++                    }
++                }
++            }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++
++        const threadgroup float* st = s_tile + hg * 16 * BK;
++        const int n_ks = (tile_keys + 15) / 16;
++        const short c4[4] = {0, 1, 8, 9};
++        float rmax[2] = {m_run[0], m_run[1]};
++        for (short ks = 0; ks < n_ks; ++ks) {
++            for (short j = 0; j < 4; ++j) {
++                const int key = ks * 16 + cb + c4[j];
++                if (sel[buf][key] >= 0) {
++                    for (short i = 0; i < 2; ++i) {
++                        rmax[i] = max(rmax[i], st[(fm + i * 8) * BK + key] * scale_log2);
++                    }
++                }
++            }
++        }
++        float factor[2];
++        float rsum[2] = {0.0f, 0.0f};
++        for (short i = 0; i < 2; ++i) {
++            rmax[i] = max(rmax[i], simd_shuffle_xor(rmax[i], ushort(1)));
++            rmax[i] = max(rmax[i], simd_shuffle_xor(rmax[i], ushort(8)));
++            factor[i] = fast::exp2(m_run[i] - rmax[i]);
++            m_run[i] = rmax[i];
++        }
++        for (short e = 0; e < 16; ++e) {
++            const float f = factor[e >> 3];
++            o0[e] *= f;
++            o1[e] *= f;
++            o2[e] *= f;
++            o3[e] *= f;
++        }
++        for (short ks = 0; ks < n_ks; ++ks) {
++            for (short i = 0; i < 2; ++i) {
++                const int r = fm + i * 8;
++                for (short j = 0; j < 4; ++j) {
++                    const int key = ks * 16 + cb + c4[j];
++                    const float e = sel[buf][key] < 0
++                        ? 0.0f
++                        : fast::exp2(st[r * BK + key] * scale_log2 - rmax[i]);
++                    pa[i * 4 + j] = e;
++                    rsum[i] += e;
++                }
++            }
++            const int kp0 = sel[buf][ks * 16 + fm];
++            const int kp1 = sel[buf][ks * 16 + fm + 8];
++            const device T* v0 = kv + ulong(max(kp0, 0)) * D + dq * 128 + cb;
++            const device T* v1 = kv + ulong(max(kp1, 0)) * D + dq * 128 + cb;
++            for (short np = 0; np < 4; ++np) {
++                for (short t = 0; t < 4; ++t) {
++                    for (short u = 0; u < 2; ++u) {
++                        pb[t * 2 + u] = v0[np * 32 + t * 8 + u];
++                        pb[8 + t * 2 + u] = v1[np * 32 + t * 8 + u];
++                    }
++                }
++                if (np == 0) {
++                    pv_op.run(pa, pb, o0);
++                } else if (np == 1) {
++                    pv_op.run(pa, pb, o1);
++                } else if (np == 2) {
++                    pv_op.run(pa, pb, o2);
++                } else {
++                    pv_op.run(pa, pb, o3);
++                }
++            }
++        }
++        for (short i = 0; i < 2; ++i) {
++            rsum[i] += simd_shuffle_xor(rsum[i], ushort(1));
++            rsum[i] += simd_shuffle_xor(rsum[i], ushort(8));
++            l_run[i] = l_run[i] * factor[i] + rsum[i];
++        }
++    }
++
++    for (short i = 0; i < 2; ++i) {
++        device T* orow = out + (ulong(head0 + fm + i * 8) * L + qi) * D + dq * 128 + cb;
++        const float denom = l_run[i] > 0.0f ? l_run[i] : 1.0f;
++        for (short t = 0; t < 4; ++t) {
++            for (short u = 0; u < 2; ++u) {
++                const short e = i * 8 + t * 2 + u;
++                orow[t * 8 + u] = T(o0[e] / denom);
++                orow[32 + t * 8 + u] = T(o1[e] / denom);
++                orow[64 + t * 8 + u] = T(o2[e] / denom);
++                orow[96 + t * 8 + u] = T(o3[e] / denom);
++            }
++        }
++    }
++"""
++
++_KERNEL = None
++
++
++def _kernel():
++    global _KERNEL
++    if _KERNEL is None:
++        _KERNEL = mx.fast.metal_kernel(
++            name="omlx_glm_sparse_mla_nax",
++            input_names=["q", "kv", "idx", "params", "scale"],
++            output_names=["out"],
++            header=_HEADER,
++            source=_SOURCE,
++        )
++    return _KERNEL
++
++
++@lru_cache(maxsize=1)
++def nax_sparse_mla_available() -> bool:
++    if not _ENABLED:
++        return False
++    try:
++        from omlx.custom_kernels.nax import is_nax_available
++
++        return bool(is_nax_available())
++    except Exception:  # noqa: BLE001
++        return False
++
++
++def sparse_mla_attention_nax(
++    q_latent: mx.array,
++    kv_latent: mx.array,
++    topk_indices: mx.array,
++    scale: float,
++) -> Optional[mx.array]:
++    """Causal sparse MLA prefill for NoPE latents on the tensor units.
++
++    q_latent: [1, H, L, 512], kv_latent: [1, 1, K, 512] (bf16/fp16, the
++    last L rows are the queries' own positions), topk_indices:
++    [1, 1, L, TOPK] int32 key rows (negative, >= K or past the query's
++    position = unused slot). Returns [1, H, L, 512] or None when the inputs
++    are outside what the kernel handles.
++    """
++    if not nax_sparse_mla_available():
++        return None
++    if (
++        q_latent.ndim != 4
++        or kv_latent.ndim != 4
++        or topk_indices.ndim != 4
++        or q_latent.shape[0] != 1
++        or kv_latent.shape[:2] != (1, 1)
++        or topk_indices.shape[:2] != (1, 1)
++        or q_latent.shape[-1] != _D_LATENT
++        or kv_latent.shape[-1] != _D_LATENT
++        or q_latent.shape[1] % _HEADS_PER_GROUP != 0
++        or q_latent.dtype not in (mx.float16, mx.bfloat16)
++        or kv_latent.dtype != q_latent.dtype
++        or topk_indices.dtype not in (mx.int32, mx.uint32)
++    ):
++        return None
++    _, H, L, _ = q_latent.shape
++    K = kv_latent.shape[2]
++    topk = topk_indices.shape[-1]
++    if L < 1 or K < L or topk_indices.shape[2] != L or topk < 1:
++        return None
++    idx = topk_indices[0, 0]
++    if idx.dtype != mx.int32:
++        idx = idx.astype(mx.int32)
++    params = mx.array([L, K, topk, K - L], dtype=mx.int32)
++    out = _kernel()(
++        inputs=[q_latent[0], kv_latent[0, 0], idx, params, mx.array([scale], mx.float32)],
++        template=[("T", q_latent.dtype)],
++        grid=(L * 256, H // _HEADS_PER_GROUP, 1),
++        threadgroup=(256, 1, 1),
++        output_shapes=[(H, L, _D_LATENT)],
++        output_dtypes=[q_latent.dtype],
++    )[0]
++    return out[None]
+diff --git a/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py b/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py
+index 4f21424f..6f99a797 100644
+--- a/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py
++++ b/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py
+@@ -33,6 +33,7 @@ if _p2hc_os.environ.get("OMLX_P2_HC_GEMV", "0") == "1" and not getattr(HyperConn
+ from mlx_lm.models.mla import MultiLinear
+ from omlx.patches import glm53_kda_prework
+ from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
++from omlx.patches.glm_moe_dsa.sparse_mla_nax import sparse_mla_attention_nax
+ from omlx.patches.glm_moe_dsa.deepseek_v32 import (
+     Model as DSV32Model,
+     group_expert_select,
+@@ -42,6 +43,11 @@ from omlx.patches.glm_moe_dsa.sparse_mla import (
+     q8_vup_flat,
+     sparse_mla_attention,
+ )
++from omlx.patches.glm_moe_dsa.indexer_nax import (
++    indexer_scores_nax,
++    max_rows_per_call,
++    nax_indexer_available,
++)
+ from .config import ModelConfig, TextConfig
+ from .gated_delta import gated_delta_update
+ from .linear import fused_quantized_matmul, linear_forward
+@@ -570,6 +576,7 @@ class Glm5NextIndexer(nn.Module):
+                 valid_cur = mx.ones((B, S), dtype=mx.bool_)
+                 total_max = after
+         else:
++            before = 0
+             before_a = mx.zeros((B,), dtype=mx.int32)
+             valid_cur = mx.ones((B, S), dtype=mx.bool_)
+             usable = (S // self.index_kpool) * self.index_kpool
+@@ -599,8 +606,30 @@ class Glm5NextIndexer(nn.Module):
+         tail_on = self.index_kpool_always_select_tail and self.index_kpool > 1
+         output_width = self.index_topk + (self.index_kpool - 1 if tail_on else 0)
+ 
++        # Tensor-unit scores with the causal pool mask folded in, for all
++        # scored rows of the chunk at once (single sequence).
++        before_s = before[0] if isinstance(before, list) and B == 1 else before
++        pool_len_s = (
++            pool_lengths[0]
++            if isinstance(pool_lengths, list) and B == 1
++            else pool_lengths
++        )
++        nax_scores = (
++            B == 1
++            and isinstance(before_s, int)
++            and isinstance(pool_len_s, int)
++            and select_k == 512
++            and self.n_heads == 32
++            and self.head_dim == 128
++            and q.dtype == mx.bfloat16
++            and pool_keys.dtype == mx.bfloat16
++            and nax_indexer_available()
++        )
+         tail_rows = S - score_from
+-        chunk = 512 if tail_rows > 512 else tail_rows
++        if nax_scores:
++            chunk = min(tail_rows, max_rows_per_call(P))
++        else:
++            chunk = 512 if tail_rows > 512 else tail_rows
+         out = []
+         for c0 in range(score_from, S, chunk):
+             c1 = min(c0 + chunk, S)
+@@ -608,25 +637,48 @@ class Glm5NextIndexer(nn.Module):
+             q_chunk = q[:, c0:c1]
+             weights = linear_forward(self.weights_proj, x[:, c0:c1])
+             weights = (weights * self.weight_scale).astype(q_chunk.dtype)
+-            index_scores = self._native_scores(q_chunk, pool_keys, weights)
+-            if index_scores is None:
+-                head_scores = q_chunk @ pool_keys[:, None].swapaxes(-1, -2)
+-                index_scores = mx.sum(
+-                    weights[..., None]
+-                    * mx.maximum(head_scores, mx.array(0, head_scores.dtype)),
+-                    axis=2,
+-                )
+             query_pos = before_a[:, None] + mx.arange(c0, c1)[None]
+-            valid_candidates = (
+-                pool_idx[None, None] < pool_lengths_a[:, None, None]
+-            ) & (pool_end[None, None] <= query_pos[..., None])
+-            index_scores = mx.where(valid_candidates, index_scores, -1e30)
++            index_scores = None
++            if nax_scores:
++                index_scores = indexer_scores_nax(
++                    q_chunk[0],
++                    pool_keys[0],
++                    weights[0],
++                    before_s + c0,
++                    pool_len_s,
++                    self.index_kpool,
++                )
++            if index_scores is not None:
++                index_scores = index_scores[None]
++                valid_candidates = None
++            else:
++                index_scores = self._native_scores(q_chunk, pool_keys, weights)
++                if index_scores is None:
++                    head_scores = q_chunk @ pool_keys[:, None].swapaxes(-1, -2)
++                    index_scores = mx.sum(
++                        weights[..., None]
++                        * mx.maximum(head_scores, mx.array(0, head_scores.dtype)),
++                        axis=2,
++                    )
++                valid_candidates = (
++                    pool_idx[None, None] < pool_lengths_a[:, None, None]
++                ) & (pool_end[None, None] <= query_pos[..., None])
++                index_scores = mx.where(valid_candidates, index_scores, -1e30)
+             selected = self._native_topk(index_scores, select_k)
+             if selected is None:
+                 selected = mx.argpartition(-index_scores, kth=select_k - 1, axis=-1)[
+                     ..., :select_k
+                 ]
+-            selected_valid = mx.take_along_axis(valid_candidates, selected, axis=-1)
++            if valid_candidates is None:
++                # Same validity rule as valid_candidates, evaluated only at
++                # the selected pools.
++                selected_valid = (selected < pool_lengths_a[:, None, None]) & (
++                    (selected + 1) * self.index_kpool - 1 <= query_pos[..., None]
++                )
++            else:
++                selected_valid = mx.take_along_axis(
++                    valid_candidates, selected, axis=-1
++                )
+             selected_indices = (
+                 selected[..., None] * self.index_kpool
+                 + mx.arange(self.index_kpool)[None, None, None]
+@@ -868,11 +920,15 @@ class Glm5NextSparseAttention(nn.Module):
+                     mx.float16 if q_latent.dtype == mx.float32 else q_latent.dtype
+                 )
+                 q_latent = q_latent.astype(native_dtype)
+-                q_pe = mx.zeros(q_latent.shape[:-1] + (64,), dtype=native_dtype)
+                 kv_latent_native = kv_latent.astype(native_dtype)
+-                k_pe = mx.zeros(kv_latent.shape[:-1] + (64,), dtype=native_dtype)
+-                output = None
+-                if Kv >= 4096:
++                # Tensor-unit kernel (M5): same fp32 math as the native
++                # kernel, at any context the indexer runs for.
++                output = sparse_mla_attention_nax(
++                    q_latent, kv_latent_native, topk_indices, self.scale
++                )
++                if output is None and Kv >= 4096:
++                    q_pe = mx.zeros(q_latent.shape[:-1] + (64,), dtype=native_dtype)
++                    k_pe = mx.zeros(kv_latent.shape[:-1] + (64,), dtype=native_dtype)
+                     output = sparse_mla_attention(
+                         q_latent,
+                         q_pe,
+diff --git a/omlx/scheduler.py b/omlx/scheduler.py
+index b9a15dbb..3a0061c0 100644
+--- a/omlx/scheduler.py
++++ b/omlx/scheduler.py
+@@ -540,6 +540,45 @@ class _CacheFreshnessWait:
+     deadline_s: float
+ 
+ 
++# GLM-5.3 prefill chunk on NAX (M5) hosts that run the DSA sparse attention
++# on the tensor units: its cost per query no longer depends on the chunk, so
++# a wider chunk only feeds the 288-expert MoE more rows per expert (M5 Ultra,
++# stock mlx: 4096 is +3-6% over 2048, 8192 another +2-6% at 16k-64k prompts
++# for ~2 GB more peak memory). Hosts below 128 GB keep 4096-token chunks.
++_GLM5_NAX_PREFILL_STEP = 8192
++_GLM5_NAX_PREFILL_STEP_SMALL_HOST = 4096
++
++
++def _glm5_next_nax_prefill_step() -> int:
++    """Prefill floor for GLM-5.3 on NAX hosts (0 keeps the default step).
++
++    Needs the tensor-unit sparse MLA path; the paged-cache block follows the
++    floor, so larger blocks also make prefix-cache reuse coarser.
++    OMLX_GLM5_PREFILL_STEP overrides it (0 keeps the default step, e.g.
++    4096 for finer prefix-cache blocks and a lower activation peak).
++    """
++    raw = os.environ.get("OMLX_GLM5_PREFILL_STEP", "").strip()
++    if raw:
++        try:
++            return max(0, int(raw))
++        except ValueError:
++            logger.warning("Ignoring invalid OMLX_GLM5_PREFILL_STEP=%r", raw)
++    try:
++        from .custom_kernels.nax import is_nax_available
++        from .patches.glm_moe_dsa.sparse_mla_nax import nax_sparse_mla_available
++        from .settings import get_system_memory
++    except ImportError:
++        return 0
++    if not (is_nax_available() and nax_sparse_mla_available()):
++        return 0
++    memory = get_system_memory()
++    if memory >= 128 * 1024**3:
++        return _GLM5_NAX_PREFILL_STEP
++    if memory >= 64 * 1024**3:
++        return _GLM5_NAX_PREFILL_STEP_SMALL_HOST
++    return 0
++
++
+ # ---------------------------------------------------------------------------
+ # Monkey-patch GenerationBatch._step to feed grammar processors the token
+ # that was sampled from their bitmask.  In the pipelined _step(), logits
+@@ -2924,6 +2963,9 @@ class Scheduler:
+                     "glm_dsa_sparse_mla_attention"
+                 ):
+                     return 0
++                glm_step = _glm5_next_nax_prefill_step()
++                if glm_step:
++                    return glm_step
+             if is_qwen35 or is_qwen4 or is_glm5_next:
+                 from .custom_kernels.nax import is_nax_available
+                 from .settings import get_system_memory
+diff --git a/tests/test_glm_dsa_indexer_nax.py b/tests/test_glm_dsa_indexer_nax.py
+new file mode 100644
+index 00000000..e560ca88
+--- /dev/null
++++ b/tests/test_glm_dsa_indexer_nax.py
+@@ -0,0 +1,332 @@
++# SPDX-License-Identifier: Apache-2.0
++"""GLM-5.3 tensor-unit (NAX) DSA indexer scores."""
++
++from __future__ import annotations
++
++import mlx.core as mx
++import pytest
++
++from omlx.patches import mlx_vlm_glm5_next_compat as compat
++from omlx.patches.glm_moe_dsa import indexer_nax
++
++pytestmark = pytest.mark.skipif(
++    not indexer_nax.nax_indexer_available(),
++    reason="needs an M5 (NAX) GPU",
++)
++
++
++@pytest.fixture(autouse=True)
++def _apply_glm5_next_compat():
++    compat.apply_mlx_vlm_glm5_next_compat_patch()
++
++
++def _bf16_ulp_distance(a: mx.array, b: mx.array) -> mx.array:
++    ai = a.view(mx.int16).astype(mx.int32)
++    bi = b.view(mx.int16).astype(mx.int32)
++    ai = mx.where(ai < 0, -32768 - ai, ai)
++    bi = mx.where(bi < 0, -32768 - bi, bi)
++    return mx.abs(ai - bi)
++
++
++def _reference(q, k, w, before, pool_len, ratio):
++    """fp32 scores, heads accumulated in order, masked like the call site."""
++    S, H, _ = q.shape
++    P = k.shape[0]
++    qf, kf, wf = (a.astype(mx.float32) for a in (q, k, w))
++    acc = mx.zeros((S, P), mx.float32)
++    for h in range(H):
++        acc = acc + mx.maximum(qf[:, h] @ kf.T, 0.0) * wf[:, h : h + 1]
++    s = mx.arange(S)[:, None]
++    p = mx.arange(P)[None]
++    valid = (p < pool_len) & ((p + 1) * ratio - 1 <= before + s)
++    return acc, valid
++
++
++def _inputs(S, P, seed=0):
++    mx.random.seed(seed)
++    q = (mx.random.normal((S, 32, 128)) * 0.5).astype(mx.bfloat16)
++    k = (mx.random.normal((P, 128)) * 0.5).astype(mx.bfloat16)
++    w = (mx.random.normal((S, 32)) * 0.1).astype(mx.bfloat16)
++    return q, k, w
++
++
++@pytest.mark.parametrize(
++    "S,P,before",
++    [(64, 64, 192), (100, 300, 1000), (511, 1024, 3584), (257, 777, 3000), (33, 600, 2400)],
++)
++def test_scores_match_fp32_reference_and_mask(S, P, before):
++    q, k, w = _inputs(S, P)
++    pool_len = min(P, (before + S) // 4)
++    out = indexer_nax.indexer_scores_nax(q, k, w, before, pool_len, 4)
++    acc, valid = _reference(q, k, w, before, pool_len, 4)
++    mx.eval(out, acc, valid)
++    assert out.shape == (S, P) and out.dtype == mx.bfloat16
++    # Masked entries carry exactly the sentinel the old mx.where wrote.
++    sentinel = mx.where(valid, out, mx.array(-1e30, mx.bfloat16))
++    assert mx.array_equal(out.view(mx.int16), sentinel.view(mx.int16)).item()
++    # Live entries: the fp32 sum rounded to bf16, up to summation order.
++    ref = acc.astype(mx.bfloat16)
++    ulp = mx.where(valid, _bf16_ulp_distance(out, ref), 0)
++    scale = mx.abs(mx.where(valid, acc, 0)).max(axis=-1, keepdims=True)
++    err = mx.where(valid, mx.abs(out.astype(mx.float32) - acc), 0)
++    # Within one bf16 ulp of the value, or tiny relative to the row scale
++    # (cancellation near zero).
++    ok = (ulp <= 1) | (err <= 1e-4 * scale)
++    assert mx.all(ok).item()
++
++
++def test_scores_match_native_kernel_within_rounding():
++    from omlx.custom_kernels.glm_moe_dsa import fast
++
++    if not fast.has_symbol("dsa_indexer_scores"):
++        pytest.skip("native DSA indexer kernel unavailable")
++    S, P, before = 512, 1024, 3584
++    q, k, w = _inputs(S, P, seed=1)
++    pool_len = P
++    out = indexer_nax.indexer_scores_nax(q, k, w, before, pool_len, 4)
++    native = fast.dsa_indexer_scores(
++        q[None].transpose(0, 2, 1, 3), k[None, None], w[None], causal=False
++    )[0, 0]
++    acc, valid = _reference(q, k, w, before, pool_len, 4)
++    native = mx.where(valid, native, -1e30)
++    mx.eval(out, native, acc)
++    scale = mx.abs(acc).max(axis=-1, keepdims=True)
++    diff = mx.abs(out.astype(mx.float32) - native.astype(mx.float32))
++    ulp = _bf16_ulp_distance(out, native)
++    assert mx.all((ulp <= 2) | (diff <= 1e-4 * scale)).item()
++
++
++def test_unsupported_inputs_return_none():
++    q, k, w = _inputs(8, 16)
++    assert indexer_nax.indexer_scores_nax(q.astype(mx.float16), k, w, 0, 16, 4) is None
++    assert indexer_nax.indexer_scores_nax(q[..., :64], k, w, 0, 16, 4) is None
++    assert indexer_nax.indexer_scores_nax(q, k, w[:4], 0, 16, 4) is None
++
++
++def test_row_cap_is_a_multiple_of_64():
++    assert indexer_nax.max_rows_per_call(1) % 64 == 0
++    assert indexer_nax.max_rows_per_call(1 << 30) == 64
++    assert indexer_nax.max_rows_per_call(16384) == (1 << 27) // 16384
++
++
++def _make_indexer():
++    from mlx.utils import tree_map
++    from mlx_vlm.models import glm5_next
++    from mlx_vlm.models.glm5_next.language import Glm5NextIndexer
++
++    text = glm5_next.TextConfig(
++        model_type="glm5_next_text",
++        vocab_size=128,
++        hidden_size=64,
++        intermediate_size=64,
++        moe_intermediate_size=16,
++        num_hidden_layers=1,
++        num_attention_heads=2,
++        num_key_value_heads=1,
++        n_shared_experts=None,
++        n_routed_experts=None,
++        routed_scaling_factor=1.0,
++        kv_lora_rank=8,
++        q_lora_rank=32,
++        qk_rope_head_dim=0,
++        v_head_dim=8,
++        qk_nope_head_dim=8,
++        num_experts_per_tok=2,
++        first_k_dense_replace=99,
++        max_position_embeddings=8192,
++        rms_norm_eps=1e-5,
++        index_topk=2048,
++        index_head_dim=128,
++        index_n_heads=32,
++        layer_types=["deepseek_sparse_attention"],
++        mlp_layer_types=["dense"],
++        linear_attn_config={
++            "num_heads": 2,
++            "head_dim": 32,
++            "short_conv_kernel_size": 4,
++            "gate_lower_bound": -5.0,
++        },
++        index_kpool=4,
++        hc_mult=2,
++        hc_sinkhorn_iters=2,
++    )
++    mx.random.seed(3)
++    indexer = Glm5NextIndexer(text)
++    indexer.index_kpool_compress_gate = mx.random.normal((128, 64)) * 0.1
++    indexer.index_kpool_compress_ape = mx.random.normal((4, 128)) * 0.1
++    indexer.update(tree_map(lambda a: a.astype(mx.bfloat16), indexer.parameters()))
++    return indexer
++
++
++def _run_indexer(indexer, chunks, seed=5):
++    from mlx_lm.models.cache import KVCache, PoolingCache
++
++    mx.random.seed(seed)
++    pool = PoolingCache(4)
++    kv = KVCache()
++    outs = []
++    for n in chunks:
++        x = mx.random.normal((1, n, 64)).astype(mx.bfloat16)
++        qr = mx.random.normal((1, n, 32)).astype(mx.bfloat16)
++        kv.update_and_fetch(
++            mx.zeros((1, 1, n, 8), mx.bfloat16), mx.zeros((1, 1, n, 0), mx.bfloat16)
++        )
++        out = indexer(x, qr, None, cache=pool, kv_cache=kv)
++        if out is not None:
++            mx.eval(out)
++        outs.append(out)
++    return outs
++
++
++def _native_masked_scores(q, pool_keys, weights, before, pool_len, ratio):
++    """The previous call-site computation: native kernel + mx.where mask."""
++    from mlx_vlm.models.glm5_next import language
++
++    idx = language.Glm5NextIndexer.__new__(language.Glm5NextIndexer)
++    idx.n_heads = q.shape[1]
++    idx.head_dim = q.shape[2]
++    scores = language.Glm5NextIndexer._native_scores(
++        idx, q[None], pool_keys[None], weights[None]
++    )[0]
++    S, P = scores.shape
++    s = mx.arange(S)[:, None]
++    p = mx.arange(P)[None]
++    valid = (p < pool_len) & ((p + 1) * ratio - 1 <= before + s)
++    return mx.where(valid, scores, -1e30)
++
++
++def test_indexer_fast_path_plumbing_is_exact(monkeypatch):
++    """With the old score computation plugged in, the all-rows fast path
++    returns bit-identical top-k indices to the 512-row loop."""
++    from mlx_vlm.models.glm5_next import language
++
++    indexer = _make_indexer()
++    chunks = [2600, 700, 1500]
++
++    monkeypatch.setattr(language, "nax_indexer_available", lambda: False)
++    expected = _run_indexer(indexer, chunks)
++
++    monkeypatch.setattr(language, "nax_indexer_available", lambda: True)
++    monkeypatch.setattr(language, "indexer_scores_nax", _native_masked_scores)
++    got = _run_indexer(indexer, chunks)
++
++    assert expected[0] is not None
++    for e, g in zip(expected, got):
++        assert e.shape == g.shape and e.dtype == g.dtype
++        assert mx.array_equal(e, g).item()
++
++
++def test_indexer_nax_selection_matches_up_to_near_ties(monkeypatch):
++    from mlx_vlm.models.glm5_next import language
++
++    indexer = _make_indexer()
++    chunks = [2600, 700]
++
++    monkeypatch.setattr(language, "nax_indexer_available", lambda: False)
++    expected = _run_indexer(indexer, chunks)
++    monkeypatch.setattr(language, "nax_indexer_available", lambda: True)
++    got = _run_indexer(indexer, chunks)
++
++    for e, g in zip(expected, got):
++        e = mx.sort(e[0, 0], axis=-1)
++        g = mx.sort(g[0, 0], axis=-1)
++        rows_equal = mx.all(e == g, axis=-1)
++        # bf16 scores tie often; the kernels differ only in fp32 summation
++        # order, so at most a few rows may pick a different tie member.
++        assert mx.mean(rows_equal.astype(mx.float32)).item() > 0.97
++
++
++def test_indexer_row_chunking_is_exact(monkeypatch):
++    """A score-buffer cap that splits the rows gives identical indices."""
++    from mlx_vlm.models.glm5_next import language
++
++    indexer = _make_indexer()
++    chunks = [2600, 700]
++    monkeypatch.setattr(language, "nax_indexer_available", lambda: True)
++    whole = _run_indexer(indexer, chunks)
++    monkeypatch.setattr(indexer_nax, "_MAX_SCORE_ELEMENTS", 64 * 700)
++    split = _run_indexer(indexer, chunks)
++    for a, b in zip(whole, split):
++        assert mx.array_equal(a, b).item()
++
++
++def test_topk_differences_are_threshold_near_ties():
++    """Rows where the NAX scores select a different pool set than the native
++    scores differ only by pools whose native scores sit within one bf16 ulp
++    of that row's top-k threshold (fp32 summation order at a near-tie)."""
++    from mlx_vlm.models.glm5_next import language
++    from omlx.custom_kernels.glm_moe_dsa import fast
++
++    if not fast.has_symbol("dsa_topk_indices"):
++        pytest.skip("native top-k kernel unavailable")
++    S, P, before = 512, 4096, 16384 - 512
++    q, k, w = _inputs(S, P, seed=11)
++    native = _native_masked_scores(q, k, w, before, P, 4)
++    nax = indexer_nax.indexer_scores_nax(q, k, w, before, P, 4)
++    sel_n = language.Glm5NextIndexer._native_topk(native[None], 512)[0]
++    sel_x = language.Glm5NextIndexer._native_topk(nax[None], 512)[0]
++    vals_n = mx.sort(mx.take_along_axis(native, sel_n, axis=-1), axis=-1)
++    vals_x = mx.sort(mx.take_along_axis(native, sel_x, axis=-1), axis=-1)
++    mx.eval(vals_n, vals_x)
++    # Same multiset of native scores up to one ulp at the threshold.
++    ulp = _bf16_ulp_distance(vals_n, vals_x)
++    assert mx.max(ulp).item() <= 1
++    same = mx.all(mx.sort(sel_n, axis=-1) == mx.sort(sel_x, axis=-1), axis=-1)
++    assert mx.mean(same.astype(mx.float32)).item() > 0.9
++
++
++def test_indexer_without_cache(monkeypatch):
++    """Cache-less prefill (positions from 0) takes the NAX path and selects
++    the same pools as the native path (up to near ties)."""
++    from mlx_vlm.models.glm5_next import language
++
++    indexer = _make_indexer()
++    mx.random.seed(9)
++    x = mx.random.normal((1, 2600, 64)).astype(mx.bfloat16)
++    qr = mx.random.normal((1, 2600, 32)).astype(mx.bfloat16)
++    monkeypatch.setattr(language, "nax_indexer_available", lambda: False)
++    expected = indexer(x, qr, None, cache=None, kv_cache=None)
++    calls = []
++    orig = indexer_nax.indexer_scores_nax
++
++    def spy(*args, **kwargs):
++        calls.append(args[3])  # before
++        return orig(*args, **kwargs)
++
++    monkeypatch.setattr(language, "nax_indexer_available", lambda: True)
++    monkeypatch.setattr(language, "indexer_scores_nax", spy)
++    got = indexer(x, qr, None, cache=None, kv_cache=None)
++    assert calls == [0]
++    assert got.shape == expected.shape and got.dtype == expected.dtype
++    e = mx.sort(expected[0, 0], axis=-1)
++    g = mx.sort(got[0, 0], axis=-1)
++    rows_equal = mx.all(e == g, axis=-1)
++    assert mx.mean(rows_equal.astype(mx.float32)).item() > 0.97
++
++
++def test_nax_indexer_score_from_matches_suffix(monkeypatch):
++    """With the dense-prefix bypass the attention layer scores only the rows
++    from ``score_from`` on; the NAX path must return exactly the suffix of
++    the all-rows selection (rows are scored independently)."""
++    from mlx_vlm.models.glm5_next import language
++
++    indexer = _make_indexer()
++    mx.random.seed(21)
++    x = mx.random.normal((1, 2600, 64)).astype(mx.bfloat16)
++    qr = mx.random.normal((1, 2600, 32)).astype(mx.bfloat16)
++    calls = []
++    orig = indexer_nax.indexer_scores_nax
++
++    def spy(*args, **kwargs):
++        calls.append((args[0].shape[0], args[3]))  # (rows, first row position)
++        return orig(*args, **kwargs)
++
++    monkeypatch.setattr(language, "nax_indexer_available", lambda: True)
++    monkeypatch.setattr(language, "indexer_scores_nax", spy)
++    full = indexer(x, qr, None)
++    tail = indexer(x, qr, None, score_from=2051)
++    mx.eval(full, tail)
++    assert calls == [(2600, 0), (549, 2051)]
++    assert tail.shape[:3] == (1, 1, 549)
++    assert mx.array_equal(tail, full[:, :, 2051:]).item()
++    assert indexer(x, qr, None, score_from=2600) is None
+diff --git a/tests/test_glm_sparse_mla_nax.py b/tests/test_glm_sparse_mla_nax.py
+new file mode 100644
+index 00000000..930cda30
+--- /dev/null
++++ b/tests/test_glm_sparse_mla_nax.py
+@@ -0,0 +1,252 @@
++# SPDX-License-Identifier: Apache-2.0
++"""GLM-5.3 tensor-unit (NAX) sparse MLA prefill attention."""
++
++from __future__ import annotations
++
++import mlx.core as mx
++import pytest
++
++from omlx.patches.glm_moe_dsa import sparse_mla, sparse_mla_nax
++
++pytestmark = pytest.mark.skipif(
++    not sparse_mla_nax.nax_sparse_mla_available(),
++    reason="needs an M5 (NAX) GPU",
++)
++
++
++def _reference(q_latent, kv_latent, topk, scale):
++    """fp32 causal attention of every head over its query's selected rows."""
++    _, H, L, D = q_latent.shape
++    K = kv_latent.shape[2]
++    idx = topk[0, 0].astype(mx.int32)
++    valid = (idx >= 0) & (idx < K) & (idx <= (mx.arange(L) + (K - L))[:, None])
++    keys = kv_latent[0, 0].astype(mx.float32)[mx.where(valid, idx, 0)]
++    q = q_latent[0].swapaxes(0, 1).astype(mx.float32)
++    scores = (q @ keys.swapaxes(-1, -2)) * scale
++    scores = mx.where(valid[:, None, :], scores, -mx.inf)
++    out = mx.softmax(scores, axis=-1) @ keys
++    return out.swapaxes(0, 1)[None]
++
++
++def _inputs(L, K, topk, H=64, q_scale=1.0, dtype=mx.bfloat16, seed=0):
++    mx.random.seed(seed)
++    q = (mx.random.normal((1, H, L, 512)) * q_scale).astype(dtype)
++    kv = mx.random.normal((1, 1, K, 512)).astype(dtype)
++    pos = (K - L) + mx.arange(L)[:, None]
++    idx = (mx.random.uniform(shape=(L, topk)) * (pos + 1)).astype(mx.int32)
++    # Unused slots of every kind: negative, past the query, beyond the cache.
++    u = mx.random.uniform(shape=(L, topk))
++    idx = mx.where(u < 0.02, -1, idx)
++    idx = mx.where((u >= 0.02) & (u < 0.03), pos + 1 + (idx % 7), idx)
++    idx = mx.where((u >= 0.03) & (u < 0.035), K + 5, idx)
++    return q, kv, idx[None, None]
++
++
++def _native(q, kv, idx, scale):
++    zq = mx.zeros(q.shape[:-1] + (64,), q.dtype)
++    zk = mx.zeros(kv.shape[:-1] + (64,), kv.dtype)
++    return sparse_mla.sparse_mla_attention(q, zq, kv, zk, idx, scale)
++
++
++@pytest.mark.parametrize(
++    "L,K,topk,q_scale",
++    [(64, 256, 128, 1.0), (37, 700, 200, 1.0), (128, 4096, 2051, 1.0), (96, 8192, 2051, 3.0)],
++)
++def test_matches_fp32_reference_like_native_kernel(L, K, topk, q_scale):
++    q, kv, idx = _inputs(L, K, topk, q_scale=q_scale)
++    scale = 256**-0.5
++    out = sparse_mla_nax.sparse_mla_attention_nax(q, kv, idx, scale)
++    ref = _reference(q, kv, idx, scale)
++    mx.eval(out, ref)
++    assert out.shape == q.shape and out.dtype == q.dtype
++    err = mx.abs(out.astype(mx.float32) - ref)
++    # Output rounding: half a bf16 ulp of each value, plus fp32 slack.
++    bound = mx.abs(ref) * 2.0**-8 + 1e-3
++    assert mx.all(err <= bound).item()
++    native = _native(q, kv, idx, scale)
++    if native is not None:
++        n_err = mx.abs(native.astype(mx.float32) - ref)
++        # Same arithmetic as the native kernel, different summation order.
++        assert mx.mean(err).item() <= 1.05 * mx.mean(n_err).item() + 1e-6
++        assert mx.max(err).item() <= 1.05 * mx.max(n_err).item() + 1e-3
++
++
++def test_fp16_inputs():
++    q, kv, idx = _inputs(40, 1024, 300, dtype=mx.float16)
++    scale = 256**-0.5
++    out = sparse_mla_nax.sparse_mla_attention_nax(q, kv, idx, scale)
++    ref = _reference(q, kv, idx, scale)
++    assert out.dtype == mx.float16
++    err = mx.abs(out.astype(mx.float32) - ref)
++    assert mx.all(err <= mx.abs(ref) * 2.0**-10 + 1e-3).item()
++
++
++def test_uint32_indices_match_int32():
++    q, kv, idx = _inputs(32, 512, 128)
++    scale = 256**-0.5
++    a = sparse_mla_nax.sparse_mla_attention_nax(q, kv, idx, scale)
++    b = sparse_mla_nax.sparse_mla_attention_nax(q, kv, idx.astype(mx.uint32), scale)
++    assert mx.array_equal(a, b).item()
++
++
++def test_unsupported_shapes_return_none():
++    q, kv, idx = _inputs(16, 64, 32)
++    scale = 1.0
++    f = sparse_mla_nax.sparse_mla_attention_nax
++    assert f(q[..., :256], kv[..., :256], idx, scale) is None  # latent width
++    assert f(q[:, :16], kv, idx, scale) is None  # heads not a multiple of 32
++    assert f(mx.concatenate([q, q]), kv, idx, scale) is None  # batch
++    assert f(q, kv, idx[:, :, :8], scale) is None  # rows mismatch
++    assert f(q.astype(mx.float32), kv.astype(mx.float32), idx, scale) is None
++    assert f(q, kv[:, :, :8], idx, scale) is None  # fewer keys than queries
++
++
++def test_disabled_by_env(monkeypatch):
++    monkeypatch.setattr(sparse_mla_nax, "_ENABLED", False)
++    sparse_mla_nax.nax_sparse_mla_available.cache_clear()
++    try:
++        q, kv, idx = _inputs(16, 64, 32)
++        assert sparse_mla_nax.sparse_mla_attention_nax(q, kv, idx, 1.0) is None
++    finally:
++        sparse_mla_nax.nax_sparse_mla_available.cache_clear()
++
++
++def test_deterministic_across_runs():
++    # Large enough to keep many threadgroups in flight; every run must be
++    # bit-identical (guards against threadgroup-memory races).
++    q, kv, idx = _inputs(256, 8192, 2051, q_scale=3.0, seed=4)
++    scale = 256**-0.5
++    outs = [sparse_mla_nax.sparse_mla_attention_nax(q, kv, idx, scale) for _ in range(6)]
++    mx.eval(outs)
++    for o in outs[1:]:
++        assert mx.array_equal(outs[0], o).item()
++    ref = _reference(q, kv, idx, scale)
++    err = mx.abs(outs[0].astype(mx.float32) - ref)
++    assert mx.all(err <= mx.abs(ref) * 2.0**-8 + 1e-3).item()
++
++
++def test_probabilities_keep_fp32_precision():
++    """The PV product must use the fp32 probabilities (like the native
++    kernel), not a reduced-precision copy: a value column of large
++    alternating +-1000 entries cancels in the weighted sum and exposes any
++    rounding of the probabilities (~11-bit rounding shows up as >> 1 ulp)."""
++    L, K, topk = 32, 4096, 2051
++    q, kv, idx = _inputs(L, K, topk, seed=7)
++    q = q.astype(mx.float32)
++    q[..., 0] = 0.0  # the big column must not influence the scores
++    q = q.astype(mx.bfloat16)
++    kv = kv.astype(mx.float32)
++    sign = mx.where(mx.arange(K) % 2 == 0, 1.0, -1.0)
++    kv[0, 0, :, 0] = 1000.0 * sign
++    kv = kv.astype(mx.bfloat16)
++    scale = 256**-0.5
++    out = sparse_mla_nax.sparse_mla_attention_nax(q, kv, idx, scale)
++    ref = _reference(q, kv, idx, scale)
++    mx.eval(out, ref)
++    col = ref[..., 0]
++    err = mx.abs(out[..., 0].astype(mx.float32) - col)
++    # fp32 probabilities: the error is the bf16 rounding of the result
++    # (half an ulp) plus fp32 summation noise of 1000 * sqrt(topk) * 2^-24.
++    ulp = mx.power(2.0, mx.floor(mx.log2(mx.maximum(mx.abs(col), 1e-3))) - 7)
++    assert mx.all(err <= 0.5 * ulp + 0.02).item()
++
++
++def _make_sparse_attention():
++    from mlx.utils import tree_map
++
++    from omlx.patches import mlx_vlm_glm5_next_compat as compat
++
++    compat.apply_mlx_vlm_glm5_next_compat_patch()
++    from mlx_vlm.models import glm5_next
++    from mlx_vlm.models.glm5_next.language import Glm5NextSparseAttention
++
++    text = glm5_next.TextConfig(
++        model_type="glm5_next_text",
++        vocab_size=128,
++        hidden_size=64,
++        intermediate_size=64,
++        moe_intermediate_size=16,
++        num_hidden_layers=1,
++        num_attention_heads=32,
++        num_key_value_heads=32,
++        n_shared_experts=None,
++        n_routed_experts=None,
++        routed_scaling_factor=1.0,
++        kv_lora_rank=512,
++        q_lora_rank=32,
++        qk_rope_head_dim=0,
++        v_head_dim=16,
++        qk_nope_head_dim=16,
++        num_experts_per_tok=2,
++        first_k_dense_replace=99,
++        max_position_embeddings=8192,
++        rms_norm_eps=1e-5,
++        index_topk=2048,
++        index_head_dim=128,
++        index_n_heads=32,
++        layer_types=["deepseek_sparse_attention"],
++        mlp_layer_types=["dense"],
++        linear_attn_config={
++            "num_heads": 2,
++            "head_dim": 32,
++            "short_conv_kernel_size": 4,
++            "gate_lower_bound": -5.0,
++        },
++        index_kpool=4,
++        hc_mult=2,
++        hc_sinkhorn_iters=2,
++    )
++    mx.random.seed(3)
++    attn = Glm5NextSparseAttention(text)
++    attn.indexer.index_kpool_compress_gate = mx.random.normal((128, 64)) * 0.1
++    attn.indexer.index_kpool_compress_ape = mx.random.normal((4, 128)) * 0.1
++    attn.update(tree_map(lambda a: a.astype(mx.bfloat16), attn.parameters()))
++    return attn
++
++
++def _run_attention(attn, chunks, seed=5):
++    from mlx_lm.models.cache import KVCache, PoolingCache
++
++    mx.random.seed(seed)
++    cache = [KVCache(), PoolingCache(4)]
++    outs = []
++    for n in chunks:
++        x = mx.random.normal((1, n, 64)).astype(mx.bfloat16)
++        out = attn(x, None, cache)
++        mx.eval(out)
++        outs.append(out)
++    return outs
++
++
++def test_call_site_matches_fallback_paths(monkeypatch):
++    """The GLM-5.3 call site with the NAX kernel matches the previous paths:
++    the native kernel at >= 4096 keys (same latent-space math) and the
++    expanded exact-block attention below (a reassociation of the same
++    products, so bf16 intermediate rounding differs)."""
++    attn = _make_sparse_attention()
++    chunks = [2600, 1600]  # sparse at 2600 keys, then at 4200 keys
++    monkeypatch.setattr(sparse_mla_nax, "_ENABLED", False)
++    sparse_mla_nax.nax_sparse_mla_available.cache_clear()
++    try:
++        expected = _run_attention(attn, chunks)
++    finally:
++        monkeypatch.setattr(sparse_mla_nax, "_ENABLED", True)
++        sparse_mla_nax.nax_sparse_mla_available.cache_clear()
++    calls = []
++    orig = sparse_mla_nax.sparse_mla_attention_nax
++
++    def spy(*args, **kwargs):
++        out = orig(*args, **kwargs)
++        calls.append(out is not None)
++        return out
++
++    from mlx_vlm.models.glm5_next import language
++
++    monkeypatch.setattr(language, "sparse_mla_attention_nax", spy)
++    got = _run_attention(attn, chunks)
++    assert calls == [True, True]
++    for e, g, tol in zip(expected, got, (2e-2, 1e-2)):
++        assert e.shape == g.shape and e.dtype == g.dtype
++        e32, g32 = e.astype(mx.float32), g.astype(mx.float32)
++        scale = mx.abs(e32).max().item()
++        assert mx.abs(e32 - g32).max().item() <= tol * scale
+diff --git a/tests/test_mlx_vlm_glm5_next_compat.py b/tests/test_mlx_vlm_glm5_next_compat.py
+index 66793d3f..47fd76cf 100644
+--- a/tests/test_mlx_vlm_glm5_next_compat.py
++++ b/tests/test_mlx_vlm_glm5_next_compat.py
+@@ -927,8 +927,15 @@ def test_sparse_attention_native_routes_get_fp16_despite_fp32_activations(monkey
+         seen.append(("exact_block", *(t.dtype for t in (q, k, v))))
+         return mx.zeros(q.shape, dtype=q.dtype)
+ 
++    def spy_nax(q_latent, kv_latent, topk_indices, scale):
++        # The tensor-unit kernel is tried first on M5 hosts; decline here so
++        # the native kernel route below is exercised on every host.
++        seen.append(("sparse_mla_nax", q_latent.dtype, kv_latent.dtype))
++        return None
++
+     monkeypatch.setattr(lang, "sparse_mla_attention", spy_sma)
+     monkeypatch.setattr(lang, "exact_block_token_attention", spy_eba)
++    monkeypatch.setattr(lang, "sparse_mla_attention_nax", spy_nax)
+     monkeypatch.setattr(lang, "q8_vup_flat", lambda *a, **k: None)
+     # Keep every row on the mocked native routes; the dense prefix would add
+     # a real FP32 attention pass over 2051 rows.
+@@ -937,6 +944,11 @@ def test_sparse_attention_native_routes_get_fp16_despite_fp32_activations(monkey
+     x = mx.random.normal((1, 4096, 4096), dtype=mx.float32)
+     out = attn(x, mask=None, cache=None)
+     mx.eval(out)
++    nax = [s for s in seen if s[0] == "sparse_mla_nax"]
++    assert nax, "the sparse chunk must try the tensor-unit route first"
++    assert all(dt == mx.float16 for dt in nax[0][1:]), (
++        f"tensor-unit sparse MLA received {nax[0][1:]}, expected fp16"
++    )
+     sma = [s for s in seen if s[0] == "sparse_mla"]
+     assert sma, "Kv>=4096 must attempt the native sparse MLA route"
+     assert all(dt == mx.float16 for dt in sma[0][1:]), (
+diff --git a/tests/test_scheduler.py b/tests/test_scheduler.py
+index d5d32124..3bc175b0 100644
+--- a/tests/test_scheduler.py
++++ b/tests/test_scheduler.py
+@@ -4151,6 +4151,73 @@ class TestSchedulerArraysCacheBlockAlignment:
+         finally:
+             scheduler.shutdown()
+ 
++    @pytest.mark.parametrize(
++        ("nax_sparse_mla", "env", "memory_gb", "expected"),
++        [
++            (True, None, 256, 8192),
++            (True, None, 96, 4096),
++            (True, None, 48, 0),
++            (False, None, 256, 0),
++            (True, "0", 256, 0),
++            (True, "4096", 256, 4096),
++            (False, "8192", 256, 8192),
++        ],
++    )
++    def test_glm5_next_nax_host_prefill_step(
++        self,
++        mock_tokenizer,
++        tmp_path,
++        monkeypatch,
++        nax_sparse_mla,
++        env,
++        memory_gb,
++        expected,
++    ):
++        """On NAX hosts GLM-5.3 takes 8192-token chunks (and blocks) when the
++        tensor-unit sparse MLA path is available (4096 below 128 GB);
++        OMLX_GLM5_PREFILL_STEP overrides the step (0 keeps the default)."""
++        import sys
++
++        if env is None:
++            monkeypatch.delenv("OMLX_GLM5_PREFILL_STEP", raising=False)
++        else:
++            monkeypatch.setenv("OMLX_GLM5_PREFILL_STEP", env)
++        fake = SimpleNamespace(nax_sparse_mla_available=lambda: nax_sparse_mla)
++        with (
++            patch.dict(
++                sys.modules, {"omlx.patches.glm_moe_dsa.sparse_mla_nax": fake}
++            ),
++            patch(
++                "omlx.settings.get_system_memory",
++                return_value=memory_gb * 1024**3,
++            ),
++            patch("omlx.custom_kernels.nax.is_nax_available", return_value=True),
++            patch(
++                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
++                return_value=True,
++            ),
++            patch(
++                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
++                return_value=True,
++            ),
++        ):
++            scheduler = Scheduler(
++                model=self._hybrid_model(model_type="glm5_next"),
++                tokenizer=mock_tokenizer,
++                config=SchedulerConfig(
++                    paged_ssd_cache_dir=str(tmp_path),
++                    paged_cache_block_size=256,
++                ),
++            )
++
++        try:
++            step = expected or 2048
++            assert scheduler._qwen35_prefill_floor == expected
++            assert scheduler._prefill_step_size_for_progress(0, 16384) == step
++            assert scheduler.config.paged_cache_block_size == step
++        finally:
++            scheduler.shutdown()
++
+     @pytest.mark.parametrize(
+         ("native_available", "symbol_available"),
+         [(False, False), (True, False)],

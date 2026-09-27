@@ -1,5 +1,7 @@
 # Validation log
 
+Entries before the milestone-3 one validate the 0.7.0rc1 DMG profile. Its scripts were then called `install.sh`/`serve.sh` and are now `install-dmg.sh`/`serve-dmg.sh`.
+
 ## 2026-09-26: from scratch on the M5 Ultra
 
 1. `scripts/install.sh` into a fresh `~/omlx-recipe-validate`, from the installed `/Applications/oMLX.app` 0.7.0rc1.
@@ -48,3 +50,19 @@ Served by `scripts/serve.sh`:
 
 Every miss in the 127K three-code test ended on the gate's 128-token cap (`finish_reason=length`): GLM sometimes reasons before answering.
 With MTP on and `max_tokens` 512 the test passed **10/10**, all ending on `stop`. The earlier 2-in-15 MTP-on misses weren't a quality problem.
+
+## 2026-09-27: recommended profile (milestone 3), from scratch
+
+1. `scripts/install.sh` into a fresh tree. The first attempt failed: `setup.py` imports `mlx` before it is installed. The script now installs `mlx==0.32.2` with the build deps.
+   After the fix, every native kernel loads, and the tree is **identical** to the development branch (empty `git diff` against it).
+2. Graft with `--chat-template`: the MTP shard, index and template are **byte-identical** to the development copy.
+3. Full cell through `scripts/serve.sh`:
+
+| | from scratch | milestone 3 (dev tree) |
+|---|---|---|
+| decode fresh greedy · 2K code | 68.9 · 81.6 | 68.8 · 81.5 |
+| prefill 2K · 8K · 32K · 128K · 256K | 1,219 · 1,213 · 1,245 · 1,265 · 1,196 | 1,224 · 1,209 · 1,242 · 1,264 · 1,200 |
+| warm follow-up 8K · 32K | 0.39 s · 0.51 s | 0.40 s · 0.46 s |
+| ladder c=1 · 2 · 4 · 8 | 69.1 · 75.1 · 90.1 · 109.0 | 69 · 73 · 90 · 108 |
+| reasoning · qualify gates | 12/12 · all pass (vision, tool, 127K retrieval) | 12/12 · all pass |
+| peak RAM | 200.8 GB | |

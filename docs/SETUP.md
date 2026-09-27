@@ -18,7 +18,7 @@ hf download Vontra/GLM-5.3-Flash-MLX-4bit-MTP --revision 76add2a341a1cd90ad0e86b
 hf download zai-org/GLM-5.3-Flash chat_template.jinja --revision eb9eb208eb0d988989d07a6a12d0fdeb5f52574a \
   --local-dir ~/models/src/zai-template
 
-# Graft: symlinks every backbone file, adds one 4.2 GB shard with the 2,641 layer-45 tensors, writes a new index,
+# Graft (runs with either profile's Python through scripts/python.sh): symlinks every backbone file, adds one 4.2 GB shard with the 2,641 layer-45 tensors, writes a new index,
 # and installs the official chat template
 scripts/python.sh scripts/graft_mtp.py \
   ~/models/src/dfp-GLM-5.3-Flash-oQ4e-mtp ~/models/src/vontra-mtp ~/models/mlx/GLM-5.3-Flash-oQ4e-mtp \

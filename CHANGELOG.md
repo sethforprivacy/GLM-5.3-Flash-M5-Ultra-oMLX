@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-09-27 (later)
+
+- **New recommended profile (milestone 3):** oMLX `main` @ f0d8428a from source + recipe patch + upstream PRs #3985/#3986/#3988 (pinned patch), built by `scripts/install.sh` and served by `scripts/serve.sh`. Prefill 1,224–1,264 tok/s from 2K to 256K, decode 68.8 / 81.5, all gates pass, KLD identical.
+- The 0.7.0rc1 DMG route becomes the no-build alternative: `scripts/install-dmg.sh`, `scripts/serve-dmg.sh`.
+
 ## 2026-09-27
 
 - **Vision fixed:** the graft installs the official zai-org chat template (rev eb9eb208). dfp's template is text-only and turned every image into an "unable to process" reminder. All gates pass, vision included.

@@ -1,6 +1,8 @@
 # Environment toggles
 
-Every change is an environment variable read at server start. Unset means stock oMLX 0.7.0rc1 behaviour.
+Every change is an environment variable read at server start. Unset means stock oMLX behaviour (0.7.0rc1, or main @ f0d8428a for the recommended profile).
+The same variables and values apply to both profiles; `scripts/serve.sh` and `scripts/serve-dmg.sh` set all of them.
+The upstream PRs in the recommended profile (#3985/#3986/#3988) add no variables: their kernels and 8K chunks switch on by themselves on M5-class (NAX) GPUs.
 
 | Variable | Recipe value | Stock | What it does | Evidence |
 |---|---|---|---|---|
@@ -14,7 +16,7 @@ Every change is an environment variable read at server start. Unset means stock 
 | `OMLX_GLM_KDA_FUSED_MAX_B` | `4` | `1` | Lets the fused KDA kernel take batches up to B (grid z = B·heads). Bit-exact. | B=2 step −3 % |
 | `OMLX_GLM_COMPILE_FFN_BATCH` | `1` | `0` | Compiles the FFN half for small batches too (B·S ≤ `OMLX_GLM_COMPILE_FFN_MAX_S`). Peak memory unchanged. | B=2 step −6 % |
 
-Model settings (`configs/model_settings.glm.json`, installed by `scripts/serve.sh`): MTP on, fixed depth 2.
+Model settings (`configs/model_settings.glm.json`, installed by both serve scripts): MTP on, fixed depth 2.
 
 Tuning knobs, left at their defaults: `OMLX_P2_LOOKUP_NGRAM` (8), `OMLX_P2_LOOKUP_MAX` (7; keep ≤7: GLM's indexer cache can undo at most an 8-row verify block), `OMLX_P2_LOOKUP_MAX_LONG` (same as MAX),
 `OMLX_P2_LOOKUP_LONG` (32), `OMLX_P2_LOOKUP_GATE` (1).

@@ -1,6 +1,6 @@
 # Results and evidence
 
-Hardware: Mac Studio M5 Ultra, 80-core GPU, 256 GB, macOS 27.0, `iogpu.wired_limit_mb=245760`. Engine: oMLX 0.7.0rc1 (bundled MLX 0.32.2).
+Hardware: Mac Studio M5 Ultra, 80-core GPU, 256 GB, macOS 27.0, `iogpu.wired_limit_mb=245760`. Engine: oMLX 0.7.0rc1 (bundled MLX 0.32.2) unless a row says main; the recommended profile's end-to-end numbers are in the README and in [OMLX-MAIN.md](OMLX-MAIN.md).
 Unless noted, decode tok/s comes from the wall-time difference between 32- and 512-token completions, which cancels prefill, TTFT and oMLX's burst streaming. Requests run one at a time.
 
 ## Quality

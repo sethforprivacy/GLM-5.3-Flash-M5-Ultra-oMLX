@@ -1,4 +1,8 @@
-# Optional: oMLX `main` built from source (prefill +5–7 % more)
+# oMLX `main` from source: how the recommended profile was reached
+
+The recommended profile (README) is `main` @ f0d8428a + `patches/omlx-main-f0d8428a-glm.patch` + `patches/upstream-omlx-prs-3985-3986-3988.patch`, built by `scripts/install.sh`. This page keeps the step-by-step numbers.
+
+## Step 1: main + recipe patch
 
 oMLX `main` @ [`f0d8428a`](https://github.com/jundot/omlx/commit/f0d8428a) (17 commits after 0.7.0rc1) adds upstream's own GLM-5.3 prefill port
 ([#3944](https://github.com/jundot/omlx/pull/3944)). The recipe patch is rebased onto it as `patches/omlx-main-f0d8428a-glm.patch`
@@ -23,17 +27,17 @@ All columns use the grafted MTP head at depth 2. Single runs.
 git clone https://github.com/jundot/omlx.git ~/omlx-src && cd ~/omlx-src && git checkout f0d8428a
 git apply /path/to/recipe/patches/omlx-main-f0d8428a-glm.patch
 python3.12 -m venv .venv && . .venv/bin/activate
-pip install "setuptools>=68" wheel "cmake>=3.27" "nanobind==2.15.0"
+pip install "setuptools>=68" wheel "cmake>=3.27" "nanobind==2.15.0" "mlx==0.32.2"
 OMLX_WITH_CUSTOM_KERNEL=1 pip install --no-build-isolation -e .
 python -c "from omlx.custom_kernels import native_kernel_status as s; print({k: v['available'] for k, v in s().items()})"
 ```
 
 - Without `OMLX_WITH_CUSTOM_KERNEL=1`, the install silently builds no native kernels and every kernel reports unavailable.
-- `nanobind` must match the ABI MLX 0.32.2 was built with.
+- `nanobind` must match the ABI MLX 0.32.2 was built with, and `mlx` must be installed before the build, because `setup.py` imports it.
 
-Serve with the same flags and environment as `scripts/serve.sh`, replacing the binary with `~/omlx-src/.venv/bin/omlx serve`.
+Serve with `OMLX_RECIPE_TREE=~/omlx-src scripts/serve.sh`.
 
-## Experimental: add the open upstream prefill PRs (#3985, #3986, #3988)
+## Step 2: + the open upstream prefill PRs (#3985, #3986, #3988), now part of the recommended profile
 
 jonathan308's open oMLX PRs add a tensor-unit DSA indexer (#3985), a tensor-unit sparse-MLA prefill kernel (#3986) and 8K prefill chunks on NAX hosts (#3988).
 They target GLM-5.3's biggest prefill cost: the classic-SIMD sparse-MLA kernel took 224 ms per layer for an 8K chunk at 32K context.
@@ -44,7 +48,7 @@ On top of this recipe's `main` patch (same box, our harness):
 | main + recipe patch | 1,093 | 1,094 | 1,038 |
 | **+ #3985 #3986 #3988** | **1,218** | **1,245** | **1,256** |
 
-KLD is identical (teacher-forced 0.0347 / top-1 0.9416), and reasoning 12/12 plus every qualify gate, vision included, pass. To try it after the build steps above:
+KLD is identical (teacher-forced 0.0347 / top-1 0.9416), and reasoning 12/12 plus every qualify gate, vision included, pass. `scripts/install.sh` applies them from the pinned patch. The manual equivalent:
 
 ```bash
 cd ~/omlx-src
