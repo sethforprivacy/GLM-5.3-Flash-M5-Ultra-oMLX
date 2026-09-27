@@ -57,7 +57,7 @@ Plan for about 200 GB of disk (the ~182 GB backbone plus 8.6 GB of graft source)
 
 ## Known issues
 
-- **Long-context retrieval with MTP:** in a 127K-token three-code needle test, runs with MTP on dropped the last code 2 times in 15, while MTP off went 11/11. Prompt lookup is not the cause. Details in [docs/VALIDATION.md](docs/VALIDATION.md). Set `"mtp_enabled": false` if that matters more than speed.
+- **Leave room for a little reasoning:** even at `reasoning_effort: low`, GLM sometimes reasons ~100–250 tokens before answering. With a 128-token cap, a 127K-context recall test occasionally ran out of budget mid-answer. At 512 tokens it passed 10/10 with MTP on. Don't set `max_tokens` very low.
 - **Stop token:** the model sometimes emits `<|assistant|>` plus extra text after an answer, with or without this recipe (checkpoint template).
 - **Concurrency:** prompt lookup and most kernels are single-stream. Batched decode gets the B>1 fixes (row 9): c=2 75 tok/s, c=8 109 tok/s aggregate.
 - **Greedy text** is not byte-identical to plain decoding, with or without this patch, because oMLX's multi-row verify rounds differently.

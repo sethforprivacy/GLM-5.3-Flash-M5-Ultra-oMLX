@@ -43,3 +43,8 @@ Served by `scripts/serve.sh`:
 - **reasoning 12/12**
 - **every qualify gate passes, including vision** (it had failed on every earlier run of this checkpoint) and 127K retrieval
 - ladder c=1 · 2 · 4 = 68.2 · 75.0 · 92.4 tok/s
+
+## 2026-09-27: long-context retrieval, resolved
+
+Every miss in the 127K three-code test ended on the gate's 128-token cap (`finish_reason=length`): GLM sometimes reasons before answering.
+With MTP on and `max_tokens` 512 the test passed **10/10**, all ending on `stop`. The earlier 2-in-15 MTP-on misses weren't a quality problem.
