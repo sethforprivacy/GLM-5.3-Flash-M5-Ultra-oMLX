@@ -2,7 +2,7 @@
 
 ## oMLX (Apache-2.0)
 
-`patches/omlx-0.7.0rc1-m5ultra-p2.patch` modifies files of [oMLX](https://github.com/jundot/omlx) v0.7.0rc1, Copyright its authors,
+`patches/omlx-0.7.0rc1-glm.patch` (and the `main` variant) modifies files of [oMLX](https://github.com/jundot/omlx) v0.7.0rc1, Copyright its authors,
 licensed under the Apache License 2.0 ([licenses/omlx-Apache-2.0.txt](licenses/omlx-Apache-2.0.txt)). The patch is distributed under the same license.
 
 Files changed by the patch (every change is marked in-code with a "Phase-2" / "p2" comment and sits behind an environment variable):
@@ -20,4 +20,4 @@ Files changed by the patch (every change is marked in-code with a "Phase-2" / "p
 ## Models (not included)
 
 This repository ships no weights. Check each model's license before use:
-`dfp-official/GLM-5.3-Flash-oQ4e-mtp`, `Vontra/GLM-5.3-Flash-MLX-4bit-MTP` (MIT), `mlx-community/Qwen3.8-Flash-Next-oQ6e-mtp`, and the upstream `zai-org/GLM-5.3-Flash` and Qwen models.
+`dfp-official/GLM-5.3-Flash-oQ4e-mtp`, `Vontra/GLM-5.3-Flash-MLX-4bit-MTP` (MIT), and the upstream `zai-org/GLM-5.3-Flash`.

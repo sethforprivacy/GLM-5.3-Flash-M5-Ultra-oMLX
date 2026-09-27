@@ -1,8 +1,8 @@
-diff --git a/patches/mlx_lm_mtp/batch_generator.py b/patches/mlx_lm_mtp/batch_generator.py
-index 3d1278d..2c57107 100644
---- a/patches/mlx_lm_mtp/batch_generator.py
-+++ b/patches/mlx_lm_mtp/batch_generator.py
-@@ -21,6 +21,8 @@ from collections import deque
+diff --git a/omlx/patches/mlx_lm_mtp/batch_generator.py b/omlx/patches/mlx_lm_mtp/batch_generator.py
+index 71075fb9..05a49432 100644
+--- a/omlx/patches/mlx_lm_mtp/batch_generator.py
++++ b/omlx/patches/mlx_lm_mtp/batch_generator.py
+@@ -23,6 +23,8 @@ from collections import deque
  from dataclasses import dataclass, field
  from statistics import median
  from types import SimpleNamespace
@@ -11,7 +11,7 @@ index 3d1278d..2c57107 100644
  from typing import Any, Deque, Dict, List, Optional, Tuple
  
  from omlx.prefill_progress import get_prefill_tracker
-@@ -2576,6 +2578,8 @@ def _chain_next_drafts(
+@@ -2901,6 +2903,8 @@ def _chain_next_drafts(
      hidden_rows: Any,
      committed: Any,
      prev_buf: Optional[Any],
@@ -20,7 +20,7 @@ index 3d1278d..2c57107 100644
  ) -> None:
      """Rebuild committed MTP-head history and draft the next chain.
  
-@@ -2611,7 +2615,7 @@ def _chain_next_drafts(
+@@ -2936,7 +2940,7 @@ def _chain_next_drafts(
      procs = _proc_list(gen_batch)
  
      depth = state.controller.cur if state.controller is not None else state.depth
@@ -29,8 +29,8 @@ index 3d1278d..2c57107 100644
          # Depth-0 with a stateless head (no cache to keep warm, e.g. the
          # gemma4 assistant): skip the fold entirely — on fast backbones its
          # head forward + trunk norm is a measurable per-step tax (~15% of a
-@@ -2651,6 +2655,11 @@ def _chain_next_drafts(
-     )
+@@ -2977,6 +2981,11 @@ def _chain_next_drafts(
+         )
      state.hist_offset += int(n)
  
 +    if lookup_drafts:
@@ -41,7 +41,7 @@ index 3d1278d..2c57107 100644
      draft_toks: List[Any] = []
      draft_lps: List[Any] = []
      draft_accept_lps: List[Any] = []
-@@ -3258,6 +3267,8 @@ def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
+@@ -3622,6 +3631,8 @@ def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
  
  
  def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
@@ -50,7 +50,7 @@ index 3d1278d..2c57107 100644
      """Emit a one-line summary of MTP draft/verify activity for a finished sequence.
  
      Format chosen to match PR 990's headline metrics, plus component timings
-@@ -3699,8 +3710,8 @@ def _run_verify_cycle_chain(
+@@ -4108,8 +4119,8 @@ def _run_verify_cycle_chain(
  
      # --- stats ---
      state.stats.cycles += 1
@@ -61,15 +61,16 @@ index 3d1278d..2c57107 100644
          state.stats.depth_drafted.extend([0] * pad)
          state.stats.depth_accepted.extend([0] * pad)
      for j in range(k):
-@@ -3718,6 +3729,7 @@ def _run_verify_cycle_chain(
+@@ -4125,6 +4136,8 @@ def _run_verify_cycle_chain(
  
-     def finish(shared_commit_ms=0.0):
-         finish_t0 = time.perf_counter()
-+        p2_was_lookup = _p2_lookup.ENABLED and _p2_lookup.was_pending(state)
-         # --- commit: queue emits + cache rollback ---
+     accept_ms = (time.perf_counter() - cycle_t0) * 1000
+ 
++    p2_was_lookup = _p2_lookup.ENABLED and _p2_lookup.was_pending(state)
++
+     def draft_next():
+         # --- MTP-head history + next draft chain (async-dispatched) ---
          t0 = time.perf_counter()
-         for j in range(m):
-@@ -3766,7 +3778,15 @@ def _run_verify_cycle_chain(
+@@ -4150,7 +4163,15 @@ def _run_verify_cycle_chain(
              else:
                  draft_jobs.append(job)
          elif draft_jobs is None:
@@ -86,7 +87,7 @@ index 3d1278d..2c57107 100644
          else:
              draft_jobs.append((gen_batch, state, hidden_rows, committed, prev_buf))
          state.next_main = next_main
-@@ -3774,7 +3794,7 @@ def _run_verify_cycle_chain(
+@@ -4194,7 +4215,7 @@ def _run_verify_cycle_chain(
          if materialize_boundary_emit:
              _materialize_mtp_boundary_emit(gen_batch, state)
              state.boundary_emit_pending = False
@@ -95,11 +96,11 @@ index 3d1278d..2c57107 100644
              was_warmup = bool(state.controller._warmup)
              keepalive = bool(getattr(state.mtp_cache, "fold_keepalive", False))
              if keepalive:
-diff --git a/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py b/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py
-index cd3183e..4f94d34 100644
---- a/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py
-+++ b/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py
-@@ -29,6 +29,39 @@ from .linear import fused_quantized_matmul, linear_forward
+diff --git a/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py b/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py
+index b2f9e834..15008f33 100644
+--- a/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py
++++ b/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py
+@@ -30,6 +30,39 @@ from .linear import fused_quantized_matmul, linear_forward
  
  logger = logging.getLogger(__name__)
  _NATIVE_INDEXER_WARNED = False
@@ -138,8 +139,8 @@ index cd3183e..4f94d34 100644
 +
  
  
- def glm5_next_cast_predicate(key: str) -> bool:
-@@ -207,6 +240,73 @@ class Glm5NextLinearAttention(nn.Module):
+ def _cache_parts(cache):
+@@ -216,6 +249,73 @@ class Glm5NextLinearAttention(nn.Module):
              out = inputs @ self._fw.T
          return mx.split(out, self._split_pts, axis=-1)
  
@@ -213,10 +214,10 @@ index cd3183e..4f94d34 100644
      def __call__(
          self,
          inputs: mx.array,
-@@ -214,6 +314,18 @@ class Glm5NextLinearAttention(nn.Module):
-         cache: Optional[Any] = None,
-     ) -> mx.array:
+@@ -225,6 +325,18 @@ class Glm5NextLinearAttention(nn.Module):
          B, S, _ = inputs.shape
+         if glm53_kda_prework.glm53_kda_prefill_eligible(self, inputs, mask, cache):
+             return glm53_kda_prework.glm53_kda_prefill(self, inputs, cache)
 +        if self.kda_fused_ok(inputs, mask, cache):
 +            return self.kda_fused_call(inputs, cache)
 +        if self.fuse_in and self.kda_compiled_ok(inputs, mask, cache):
@@ -232,7 +233,7 @@ index cd3183e..4f94d34 100644
          has_right_padding = cache is not None and cache.lengths is not None
          if has_right_padding:
              mask = mx.arange(S)[None] < cache.lengths[:, None]
-@@ -339,6 +451,11 @@ class Glm5NextIndexer(nn.Module):
+@@ -350,6 +462,11 @@ class Glm5NextIndexer(nn.Module):
  
      def _native_scores(self, q, pool_keys, weights):
          global _NATIVE_INDEXER_WARNED
@@ -244,7 +245,7 @@ index cd3183e..4f94d34 100644
          if (
              q.shape[2] != self.n_heads
              or self.n_heads != 32
-@@ -847,7 +964,7 @@ class Glm5NextDecoderLayer(nn.Module):
+@@ -958,7 +1075,7 @@ class Glm5NextDecoderLayer(nn.Module):
          # was validated on and where its win lives. Compiling the 288-expert MoE at a
          # batched or prefill shape spikes memory (it can OOM alongside the resident
          # weights), so those shapes take the eager path.
@@ -253,7 +254,7 @@ index cd3183e..4f94d34 100644
              if self._ffn_c is None:
                  self._ffn_c = mx.compile(self._ffn_block)
              return self._ffn_c(x)
-@@ -901,12 +1018,11 @@ class Glm5NextModel(nn.Module):
+@@ -1012,12 +1129,11 @@ class Glm5NextModel(nn.Module):
          # Keep decode lazy; the MTP replacement loop must use the same policy.
          prefill = h.shape[1] >= 256
  
@@ -268,14 +269,14 @@ index cd3183e..4f94d34 100644
  
          h = h.mean(axis=2)
          return self.norm(h)
-diff --git a/patches/mlx_vlm_mtp/glm5_next_vlm_runtime.py b/patches/mlx_vlm_mtp/glm5_next_vlm_runtime.py
-index 9beecb1..cf5f2e8 100644
---- a/patches/mlx_vlm_mtp/glm5_next_vlm_runtime.py
-+++ b/patches/mlx_vlm_mtp/glm5_next_vlm_runtime.py
-@@ -239,6 +239,23 @@ def _patch_linear_attention(g5_lang: Any) -> None:
- 
-     def __call__(self, inputs, mask=None, cache=None, gdn_sink=None):
-         B, S, _ = inputs.shape
+diff --git a/omlx/patches/mlx_vlm_mtp/glm5_next_vlm_runtime.py b/omlx/patches/mlx_vlm_mtp/glm5_next_vlm_runtime.py
+index 74d9eb1c..6f2534c1 100644
+--- a/omlx/patches/mlx_vlm_mtp/glm5_next_vlm_runtime.py
++++ b/omlx/patches/mlx_vlm_mtp/glm5_next_vlm_runtime.py
+@@ -246,6 +246,23 @@ def _patch_linear_attention(g5_lang: Any) -> None:
+             self, inputs, mask, cache
+         ):
+             return glm53_kda_prework.glm53_kda_prefill(self, inputs, cache)
 +        if self.kda_fused_ok(inputs, mask, cache):
 +            return self.kda_fused_call(inputs, cache, gdn_sink)
 +        if self.fuse_in and self.kda_compiled_ok(inputs, mask, cache):
@@ -296,7 +297,7 @@ index 9beecb1..cf5f2e8 100644
          has_right_padding = cache is not None and cache.lengths is not None
          if has_right_padding:
              mask = mx.arange(S)[None] < cache.lengths[:, None]
-@@ -410,15 +427,14 @@ def _patch_model_call(g5_lang: Any) -> None:
+@@ -417,15 +434,14 @@ def _patch_model_call(g5_lang: Any) -> None:
          # This replaces Glm5NextModel.__call__; preserve its prefill memory policy.
          prefill = h.shape[1] >= 256
  
@@ -314,11 +315,11 @@ index 9beecb1..cf5f2e8 100644
  
          # Collapse the mHC streams first: everything downstream (the final
          # norm, the lm_head, and the nextn head) consumes the ordinary
-diff --git a/patches/p2_kda_fused.py b/patches/p2_kda_fused.py
+diff --git a/omlx/patches/p2_kda_fused.py b/omlx/patches/p2_kda_fused.py
 new file mode 100644
-index 0000000..fe3f156
+index 00000000..fe3f1568
 --- /dev/null
-+++ b/patches/p2_kda_fused.py
++++ b/omlx/patches/p2_kda_fused.py
 @@ -0,0 +1,162 @@
 +"""Phase-2 (mac-studio-m5-ultra): GLM-5.3 KDA decode/verify as one Metal dispatch (B=1, S<=8).
 +
@@ -482,12 +483,12 @@ index 0000000..fe3f156
 +        output_dtypes=[dt, state.dtype, dt, dt, dt, dt],
 +    )
 +    return outs
-diff --git a/patches/p2_lookup.py b/patches/p2_lookup.py
+diff --git a/omlx/patches/p2_lookup.py b/omlx/patches/p2_lookup.py
 new file mode 100644
-index 0000000..d6909af
+index 00000000..279afbcf
 --- /dev/null
-+++ b/patches/p2_lookup.py
-@@ -0,0 +1,165 @@
++++ b/omlx/patches/p2_lookup.py
+@@ -0,0 +1,173 @@
 +"""Phase-2 prompt-lookup drafts inside the MTP chain cycle (after mlx-serve #523/#533, MIT).
 +
 +When the newest committed tokens (ending in the token the next verify starts from) already occurred earlier in the
@@ -521,6 +522,9 @@ index 0000000..d6909af
 +GATE = os.environ.get("OMLX_P2_LOOKUP_GATE", "1") == "1"
 +_ALPHA = 0.15
 +_REPROBE = 16  # matched-but-gated opportunities between forced lookup probes
++# Verify widths (draft count k) already timed in this process. The first cycle at a new width pays one-off Metal kernel
++# compilation (tens of ms), and letting that sample into an EMA made the gate refuse lookups for most of a request.
++_SEEN_K = {"lookup": set(), "mtp": set()}
 +
 +
 +class _Lookup:
@@ -556,9 +560,14 @@ index 0000000..d6909af
 +    """Credit the cycle that just committed m+1 tokens to its draft source (wall time since the previous commit)."""
 +    lk = _get(state)
 +    now = time.perf_counter()
++    kind = "lookup" if was_lookup else "mtp"
++    first_at_width = k not in _SEEN_K[kind]
++    _SEEN_K[kind].add(k)
 +    if lk.last_t is not None:
 +        rate = (m + 1) / max(now - lk.last_t, 1e-6)
-+        if was_lookup:
++        if was_lookup and first_at_width:
++            lk.rounds += 1; lk.drafted += k; lk.accepted += m; lk.emitted += m + 1
++        elif was_lookup:
 +            b = lk.pending_bucket
 +            e = lk.ema_lk[b]
 +            lk.ema_lk[b] = rate if e is None else e + _ALPHA * (rate - e)
@@ -566,7 +575,7 @@ index 0000000..d6909af
 +            lk.drafted += k
 +            lk.accepted += m
 +            lk.emitted += m + 1
-+        elif k > 0:
++        elif k > 0 and not first_at_width:
 +            e = lk.ema_mtp
 +            lk.ema_mtp = rate if e is None else e + _ALPHA * (rate - e)
 +    lk.last_t = now

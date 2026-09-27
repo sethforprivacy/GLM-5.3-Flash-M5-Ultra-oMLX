@@ -1,13 +1,13 @@
 #!/bin/zsh
 # Build a patched oMLX tree from the official oMLX 0.7.0rc1 app, leaving the installed app untouched.
-#   scripts/install.sh [/Applications/oMLX.app] [~/omlx-m5ultra]
+#   scripts/install.sh [/Applications/oMLX.app] [~/omlx-glm-m5ultra]
 # The app is copied (Contents/ only). The recipe patch is applied to Contents/Resources/omlx, and the copy runs through its own
 # bundled Python via scripts/serve.sh. The copy never auto-updates; delete it and re-run this to rebuild.
 set -euo pipefail
 here=${0:A:h}
 app=${1:-/Applications/oMLX.app}
-dest=${2:-$HOME/omlx-m5ultra}
-patch=$here/../patches/omlx-0.7.0rc1-m5ultra-p2.patch
+dest=${2:-$HOME/omlx-glm-m5ultra}
+patch=$here/../patches/omlx-0.7.0rc1-glm.patch
 
 ver=$(defaults read "$app/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null || echo "?")
 if [[ $ver != 0.7.0rc1* ]]; then
