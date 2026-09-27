@@ -1,0 +1,656 @@
+diff --git a/omlx/patches/mlx_lm_mtp/batch_generator.py b/omlx/patches/mlx_lm_mtp/batch_generator.py
+index 71075fb9..05a49432 100644
+--- a/omlx/patches/mlx_lm_mtp/batch_generator.py
++++ b/omlx/patches/mlx_lm_mtp/batch_generator.py
+@@ -23,6 +23,8 @@ from collections import deque
+ from dataclasses import dataclass, field
+ from statistics import median
+ from types import SimpleNamespace
++
++from omlx.patches import p2_lookup as _p2_lookup
+ from typing import Any, Deque, Dict, List, Optional, Tuple
+ 
+ from omlx.prefill_progress import get_prefill_tracker
+@@ -2901,6 +2903,8 @@ def _chain_next_drafts(
+     hidden_rows: Any,
+     committed: Any,
+     prev_buf: Optional[Any],
++    lookup_drafts: Optional[List[int]] = None,
++    vocab: int = 0,
+ ) -> None:
+     """Rebuild committed MTP-head history and draft the next chain.
+ 
+@@ -2936,7 +2940,7 @@ def _chain_next_drafts(
+     procs = _proc_list(gen_batch)
+ 
+     depth = state.controller.cur if state.controller is not None else state.depth
+-    if depth == 0 and not state.mtp_cache:
++    if depth == 0 and not state.mtp_cache and not lookup_drafts:
+         # Depth-0 with a stateless head (no cache to keep warm, e.g. the
+         # gemma4 assistant): skip the fold entirely — on fast backbones its
+         # head forward + trunk norm is a measurable per-step tax (~15% of a
+@@ -2977,6 +2981,11 @@ def _chain_next_drafts(
+         )
+     state.hist_offset += int(n)
+ 
++    if lookup_drafts:
++        # p2 prompt lookup: the head has folded the committed tokens; verify the earlier continuation instead of a chain.
++        _p2_lookup.set_drafts(state, lookup_drafts, vocab)
++        return
++
+     draft_toks: List[Any] = []
+     draft_lps: List[Any] = []
+     draft_accept_lps: List[Any] = []
+@@ -3622,6 +3631,8 @@ def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
+ 
+ 
+ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
++    if _p2_lookup.ENABLED:
++        _p2_lookup.log_stats(uid, stats)
+     """Emit a one-line summary of MTP draft/verify activity for a finished sequence.
+ 
+     Format chosen to match PR 990's headline metrics, plus component timings
+@@ -4108,8 +4119,8 @@ def _run_verify_cycle_chain(
+ 
+     # --- stats ---
+     state.stats.cycles += 1
+-    if len(state.stats.depth_drafted) < state.depth:
+-        pad = state.depth - len(state.stats.depth_drafted)
++    if len(state.stats.depth_drafted) < max(state.depth, k):
++        pad = max(state.depth, k) - len(state.stats.depth_drafted)
+         state.stats.depth_drafted.extend([0] * pad)
+         state.stats.depth_accepted.extend([0] * pad)
+     for j in range(k):
+@@ -4125,6 +4136,8 @@ def _run_verify_cycle_chain(
+ 
+     accept_ms = (time.perf_counter() - cycle_t0) * 1000
+ 
++    p2_was_lookup = _p2_lookup.ENABLED and _p2_lookup.was_pending(state)
++
+     def draft_next():
+         # --- MTP-head history + next draft chain (async-dispatched) ---
+         t0 = time.perf_counter()
+@@ -4150,7 +4163,15 @@ def _run_verify_cycle_chain(
+             else:
+                 draft_jobs.append(job)
+         elif draft_jobs is None:
+-            _chain_next_drafts(gen_batch, state, hidden_rows, committed, prev_buf)
++            p2_drafts = None
++            if _p2_lookup.ENABLED:
++                _p2_lookup.observe(state, p2_was_lookup, k, m)
++                state.stats._p2_lookup_ref = state._p2_lookup
++                p2_drafts = _p2_lookup.propose(gen_batch, state)
++            _chain_next_drafts(
++                gen_batch, state, hidden_rows, committed, prev_buf,
++                lookup_drafts=p2_drafts, vocab=int(combined_lp.shape[-1]),
++            )
+         else:
+             draft_jobs.append((gen_batch, state, hidden_rows, committed, prev_buf))
+         state.next_main = next_main
+@@ -4194,7 +4215,7 @@ def _run_verify_cycle_chain(
+         if materialize_boundary_emit:
+             _materialize_mtp_boundary_emit(gen_batch, state)
+             state.boundary_emit_pending = False
+-        if state.controller is not None:
++        if state.controller is not None and not p2_was_lookup:
+             was_warmup = bool(state.controller._warmup)
+             keepalive = bool(getattr(state.mtp_cache, "fold_keepalive", False))
+             if keepalive:
+diff --git a/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py b/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py
+index b2f9e834..15008f33 100644
+--- a/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py
++++ b/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py
+@@ -30,6 +30,39 @@ from .linear import fused_quantized_matmul, linear_forward
+ 
+ logger = logging.getLogger(__name__)
+ _NATIVE_INDEXER_WARNED = False
++import os as _os
++_INDEXER_MLX_MAX_ROWS = int(_os.environ.get("OMLX_GLM_INDEXER_MLX_MAX_ROWS", "8"))
++# Phase-2 experiment: compile KDA's decode glue (conv/silu/split/l2norm/f_b_proj before the recurrence kernel; g_b_proj/o_norm/o_proj after).
++_COMPILE_KDA = _os.environ.get("OMLX_GLM_COMPILE_KDA", "0") == "1"
++# Phase-2: compile the FFN half for B=1 up to this many rows (stock: 1). MTP verify blocks (2-8 rows) otherwise run the
++# 288-expert MoE glue eagerly; one trace per row count.
++_COMPILE_FFN_MAX_S = int(_os.environ.get("OMLX_GLM_COMPILE_FFN_MAX_S", "1"))
++
++# Phase-2 (mac-studio-m5-ultra): rc1 added mx.eval + mx.clear_cache after every layer of every prefill chunk (bounding memory);
++# 0.7.0.dev2 stayed lazy. OMLX_GLM_PREFILL_SYNC: "layer" (stock rc1), "eval" (per-layer eval, keep the buffer cache),
++# "<N>" (eval + clear every N layers), "cache:<GB>" (eval; clear when the pool exceeds GB), "none" (dev2: lazy).
++_PREFILL_SYNC = _os.environ.get("OMLX_GLM_PREFILL_SYNC", "layer")
++
++
++def prefill_layer_sync(i, n_layers, h):
++    m = _PREFILL_SYNC
++    if m == "none":
++        return
++    if m == "eval":
++        mx.eval(h)
++        return
++    if m.startswith("cache:"):
++        # Keep #3807's per-layer backpressure, but flush the buffer pool only once it holds more than N GB, so hosts with
++        # headroom don't re-allocate every layer's buffers.
++        mx.eval(h)
++        if mx.get_cache_memory() > float(m[6:]) * 1e9:
++            mx.clear_cache()
++        return
++    every = 1 if m == "layer" else int(m)
++    if (i + 1) % every == 0 or i + 1 == n_layers:
++        mx.eval(h)
++        mx.clear_cache()
++
+ 
+ 
+ def _cache_parts(cache):
+@@ -216,6 +249,73 @@ class Glm5NextLinearAttention(nn.Module):
+             out = inputs @ self._fw.T
+         return mx.split(out, self._split_pts, axis=-1)
+ 
++    def _kda_pre(self, mixed, conv_state, fa_o):
++        B, S, _ = mixed.shape
++        conv_input = mx.concatenate([conv_state, mixed], axis=1)
++        new_conv = mx.contiguous(conv_input[:, -(self.conv_kernel_size - 1):, :])
++        conv_out = nn.silu(self.conv1d(conv_input))
++        q, k, v = mx.split(conv_out, [self.qkv_dim, 2 * self.qkv_dim], axis=-1)
++        q = q.reshape(B, S, self.num_heads, self.head_dim)
++        k = k.reshape(B, S, self.num_heads, self.head_dim)
++        v = v.reshape(B, S, self.num_heads, self.head_dim)
++        a = linear_forward(self.forget_gate.f_b_proj, fa_o).reshape(B, S, self.num_heads, self.head_dim)
++        in_dtype = q.dtype
++        q = (_l2norm(q.astype(mx.float32)) * (self.head_dim**-0.5)).astype(in_dtype)
++        k = _l2norm(k.astype(mx.float32)).astype(in_dtype)
++        return q, k, v, a, conv_input, new_conv
++
++    def _kda_post(self, out, ga_o):
++        B, S = out.shape[:2]
++        gate = linear_forward(self.g_b_proj, ga_o).reshape(B, S, self.num_heads, self.head_dim)
++        return linear_forward(self.o_proj, self.o_norm(out, gate).reshape(B, S, -1))
++
++    def kda_fused_call(self, inputs, cache, gdn_sink=None):
++        """Phase-2: whole KDA prework + recurrence in one dispatch (omlx/patches/p2_kda_fused.py)."""
++        from omlx.patches import p2_kda_fused as _kf
++        B, S, _ = inputs.shape
++        if not self._fused_ready:
++            self._fused_in_proj(inputs)
++        fused = fused_quantized_matmul(inputs, self._fw, self._fs, self._fb, bits=self._bits, group_size=self._gs)
++        o3 = 3 * self.qkv_dim
++        fa_o = fused[..., o3:o3 + self.head_dim]
++        ga_o = fused[..., o3 + self.head_dim:o3 + 2 * self.head_dim]
++        fg = self.forget_gate
++        a = linear_forward(fg.f_b_proj, fa_o)
++        conv_state, state = cache[0], cache[1]
++        y, new_state, new_conv, qn, kn, vn = _kf.kda_fused(
++            fused, conv_state, self.conv1d.weight, a, fg.A_log, fg.dt_bias, state,
++            fg.safe_gate_lower_bound, self.num_heads, self.head_dim)
++        if gdn_sink is not None:
++            conv_input = mx.concatenate([conv_state, fused[..., :o3]], axis=1)
++            gdn_sink.append((qn, kn, vn, a.reshape(B, S, self.num_heads, self.head_dim), fused[..., -self.num_heads:],
++                             fg.A_log.reshape(self.num_heads, 1), fg.dt_bias.reshape(self.num_heads, self.head_dim),
++                             state, conv_input, self.conv_kernel_size, fg.safe_gate_lower_bound, None))
++        cache[0] = new_conv
++        cache[1] = new_state
++        cache.advance(S)
++        if getattr(self, "_kpost_c", None) is None:
++            self._kpre_c = mx.compile(self._kda_pre)
++            self._kpost_c = mx.compile(self._kda_post)
++        return self._kpost_c(y, ga_o)
++
++    def kda_fused_ok(self, inputs, mask, cache):
++        from omlx.patches import p2_kda_fused as _kf
++        # Needs the single fused in-projection: oQ mixed-bit layers whose q/k/v/f_a/g_a/b differ in bits fall back to separate
++        # matmuls in _fused_in_proj (no _fw), and take the compiled path instead.
++        return (_kf.ENABLED and self.fuse_in and getattr(self, "_fused_ready", False) and getattr(self, "_fq", False)
++                and self.kda_compiled_ok(inputs, mask, cache) and self.forget_gate.safe_gate_lower_bound is not None
++                and self.head_dim == 128)
++
++    def kda_compiled_ok(self, inputs, mask, cache):
++        return (_COMPILE_KDA and inputs.shape[0] == 1 and inputs.shape[1] <= 8 and mask is None
++                and cache is not None and cache[0] is not None and cache.lengths is None)
++
++    def kda_pre_c(self, *a):
++        if getattr(self, "_kpre_c", None) is None:
++            self._kpre_c = mx.compile(self._kda_pre)
++            self._kpost_c = mx.compile(self._kda_post)
++        return self._kpre_c(*a)
++
+     def __call__(
+         self,
+         inputs: mx.array,
+@@ -225,6 +325,18 @@ class Glm5NextLinearAttention(nn.Module):
+         B, S, _ = inputs.shape
+         if glm53_kda_prework.glm53_kda_prefill_eligible(self, inputs, mask, cache):
+             return glm53_kda_prework.glm53_kda_prefill(self, inputs, cache)
++        if self.kda_fused_ok(inputs, mask, cache):
++            return self.kda_fused_call(inputs, cache)
++        if self.fuse_in and self.kda_compiled_ok(inputs, mask, cache):
++            q_o, k_o, v_o, fa_o, ga_o, b_o = self._fused_in_proj(inputs)
++            q, k, v, a, _ci, cache[0] = self.kda_pre_c(mx.concatenate([q_o, k_o, v_o], axis=-1), cache[0], fa_o)
++            fg = self.forget_gate
++            out, state = gated_delta_update(q, k, v, a, b_o, fg.A_log.reshape(self.num_heads, 1),
++                                            fg.dt_bias.reshape(self.num_heads, self.head_dim), state=cache[1],
++                                            mask=None, lower_bound=fg.safe_gate_lower_bound)
++            cache[1] = state
++            cache.advance(S)
++            return self._kpost_c(out, ga_o)
+         has_right_padding = cache is not None and cache.lengths is not None
+         if has_right_padding:
+             mask = mx.arange(S)[None] < cache.lengths[:, None]
+@@ -350,6 +462,11 @@ class Glm5NextIndexer(nn.Module):
+ 
+     def _native_scores(self, q, pool_keys, weights):
+         global _NATIVE_INDEXER_WARNED
++        # Phase-2 (mac-studio-m5-ultra): the native kernel pads the query to 64 rows, so a decode / MTP-verify step
++        # (1-8 rows) computes up to 64x the scoring work: 0.94 ms/layer vs 0.18 ms for the plain-MLX path at a 32K pool
++        # (bench/profile/indexer_micro.py). Route short queries to the MLX fallback below. 0 restores stock behaviour.
++        if q.shape[1] <= _INDEXER_MLX_MAX_ROWS:
++            return None
+         if (
+             q.shape[2] != self.n_heads
+             or self.n_heads != 32
+@@ -958,7 +1075,7 @@ class Glm5NextDecoderLayer(nn.Module):
+         # was validated on and where its win lives. Compiling the 288-expert MoE at a
+         # batched or prefill shape spikes memory (it can OOM alongside the resident
+         # weights), so those shapes take the eager path.
+-        if self.compile_ffn and x.shape[0] == 1 and x.shape[1] == 1:
++        if self.compile_ffn and x.shape[0] == 1 and x.shape[1] <= _COMPILE_FFN_MAX_S:
+             if self._ffn_c is None:
+                 self._ffn_c = mx.compile(self._ffn_block)
+             return self._ffn_c(x)
+@@ -1012,12 +1129,11 @@ class Glm5NextModel(nn.Module):
+         # Keep decode lazy; the MTP replacement loop must use the same policy.
+         prefill = h.shape[1] >= 256
+ 
+-        for layer, c in zip(self.layers, cache):
++        for li, (layer, c) in enumerate(zip(self.layers, cache)):
+             mask = ssm_mask if layer.is_linear else fa_mask
+             h = layer(h, mask=mask, cache=c)
+             if prefill:
+-                mx.eval(h)
+-                mx.clear_cache()
++                prefill_layer_sync(li, len(self.layers), h)
+ 
+         h = h.mean(axis=2)
+         return self.norm(h)
+diff --git a/omlx/patches/mlx_vlm_mtp/glm5_next_vlm_runtime.py b/omlx/patches/mlx_vlm_mtp/glm5_next_vlm_runtime.py
+index 74d9eb1c..6f2534c1 100644
+--- a/omlx/patches/mlx_vlm_mtp/glm5_next_vlm_runtime.py
++++ b/omlx/patches/mlx_vlm_mtp/glm5_next_vlm_runtime.py
+@@ -246,6 +246,23 @@ def _patch_linear_attention(g5_lang: Any) -> None:
+             self, inputs, mask, cache
+         ):
+             return glm53_kda_prework.glm53_kda_prefill(self, inputs, cache)
++        if self.kda_fused_ok(inputs, mask, cache):
++            return self.kda_fused_call(inputs, cache, gdn_sink)
++        if self.fuse_in and self.kda_compiled_ok(inputs, mask, cache):
++            q_o, k_o, v_o, fa_o, ga_o, b_o = self._fused_in_proj(inputs)
++            q, k, v, a, conv_input, cache[0] = self.kda_pre_c(mx.concatenate([q_o, k_o, v_o], axis=-1), cache[0], fa_o)
++            fg = self.forget_gate
++            A_log = fg.A_log.reshape(self.num_heads, 1)
++            dt_bias = fg.dt_bias.reshape(self.num_heads, self.head_dim)
++            state = cache[1]
++            if gdn_sink is not None:
++                gdn_sink.append((q, k, v, a, b_o, A_log, dt_bias, state, conv_input,
++                                 self.conv_kernel_size, fg.safe_gate_lower_bound, None))
++            out, state = gated_delta_update(q, k, v, a, b_o, A_log, dt_bias, state=state, mask=None,
++                                            lower_bound=fg.safe_gate_lower_bound)
++            cache[1] = state
++            cache.advance(S)
++            return self._kpost_c(out, ga_o)
+         has_right_padding = cache is not None and cache.lengths is not None
+         if has_right_padding:
+             mask = mx.arange(S)[None] < cache.lengths[:, None]
+@@ -417,15 +434,14 @@ def _patch_model_call(g5_lang: Any) -> None:
+         # This replaces Glm5NextModel.__call__; preserve its prefill memory policy.
+         prefill = h.shape[1] >= 256
+ 
+-        for layer, c in zip(self.layers, cache):
++        for li, (layer, c) in enumerate(zip(self.layers, cache)):
+             mask = ssm_mask if layer.is_linear else fa_mask
+             if gdn_sink is not None:
+                 h = layer(h, mask=mask, cache=c, gdn_sink=gdn_sink)
+             else:
+                 h = layer(h, mask=mask, cache=c)
+             if prefill:
+-                mx.eval(h)
+-                mx.clear_cache()
++                g5_lang.prefill_layer_sync(li, len(self.layers), h)
+ 
+         # Collapse the mHC streams first: everything downstream (the final
+         # norm, the lm_head, and the nextn head) consumes the ordinary
+diff --git a/omlx/patches/p2_kda_fused.py b/omlx/patches/p2_kda_fused.py
+new file mode 100644
+index 00000000..fe3f1568
+--- /dev/null
++++ b/omlx/patches/p2_kda_fused.py
+@@ -0,0 +1,162 @@
++"""Phase-2 (mac-studio-m5-ultra): GLM-5.3 KDA decode/verify as one Metal dispatch (B=1, S<=8).
++
++Replaces, per KDA layer: concat(q,k,v) → conv1d → silu → split → l2norm(q)·scale, l2norm(k) → compute_g_safe → sigmoid(b) →
++gated-delta recurrence, plus the conv-state update. That's ~17 dispatches down to 1. It reads q/k/v/b straight out of the fused
++in-projection output (no copies) and keeps the stock path's bf16 rounding points: conv out, sigmoid, silu, normed q/k, beta.
++
++Idea after mlx-serve #517 ("GDN prework + recurrence as one dispatch", MIT); this kernel is written for KDA's vector gate.
++Enabled by OMLX_GLM_KDA_FUSED=1 (only on the compiled-KDA path, OMLX_GLM_COMPILE_KDA=1).
++"""
++from __future__ import annotations
++
++import os
++
++import mlx.core as mx
++
++ENABLED = os.environ.get("OMLX_GLM_KDA_FUSED", "0") == "1"
++
++# Same functor bodies as MLX's Metal unary ops (unary_ops.h), so rounding matches the stock graph op for op.
++_HEADER = r"""
++template <typename T> inline T p2_sigmoid(T x) {
++    auto y = 1 / (1 + metal::exp(metal::abs(x)));
++    return (x < 0) ? y : 1 - y;
++}
++"""
++
++_SRC = r"""
++    constexpr int NPT = D / 32;
++    const uint h = thread_position_in_grid.z;
++    const uint dv = thread_position_in_grid.y;
++    const uint lane = thread_index_in_simdgroup;
++    const int S = T;
++    const float scale = metal::rsqrt(float(D));
++    const float lb = lower_bound[0];
++
++#define CI(r, c) ((r) < KS - 1 ? float(conv_state[(r) * C + (c)]) : float(fused[((r) - (KS - 1)) * CTOT + (c)]))
++
++    float wq[NPT][KS], wk[NPT][KS], wv[KS], dtb[NPT], st[NPT];
++    int cq[NPT], ck[NPT];
++    const int cv = 2 * QKV + h * D + dv;
++    for (int i = 0; i < NPT; ++i) {
++        int dk = lane * NPT + i;
++        cq[i] = h * D + dk;
++        ck[i] = QKV + h * D + dk;
++        for (int t = 0; t < KS; ++t) {
++            wq[i][t] = float(convw[cq[i] * KS + t]);
++            wk[i][t] = float(convw[ck[i] * KS + t]);
++        }
++        dtb[i] = float(dt_bias[h * D + dk]);
++    }
++    for (int t = 0; t < KS; ++t) wv[t] = float(convw[cv * KS + t]);
++    const float Aexp = metal::precise::exp(float(A_log[h]));
++
++    const size_t sbase = ((size_t)h * D + dv) * D;
++    for (int i = 0; i < NPT; ++i) st[i] = float(state_in[sbase + lane * NPT + i]);
++
++    for (int s = 0; s < S; ++s) {
++        float qf[NPT], kf[NPT];
++        float qss = 0.0f, kss = 0.0f;
++        for (int i = 0; i < NPT; ++i) {
++            float aq = 0.0f, ak = 0.0f;
++            for (int t = 0; t < KS; ++t) {
++                aq += wq[i][t] * CI(s + t, cq[i]);
++                ak += wk[i][t] * CI(s + t, ck[i]);
++            }
++            InT c1 = static_cast<InT>(aq);
++            InT c2 = static_cast<InT>(ak);
++            InT s1 = p2_sigmoid(c1);
++            InT s2 = p2_sigmoid(c2);
++            qf[i] = float(static_cast<InT>(c1 * s1));
++            kf[i] = float(static_cast<InT>(c2 * s2));
++            qss += qf[i] * qf[i];
++            kss += kf[i] * kf[i];
++        }
++        qss = simd_sum(qss);
++        kss = simd_sum(kss);
++        const float qi = metal::precise::rsqrt(qss + 1e-6f), ki = metal::precise::rsqrt(kss + 1e-6f);
++        float qn[NPT], kn[NPT], g[NPT];
++        for (int i = 0; i < NPT; ++i) {
++            qn[i] = float(static_cast<InT>((qf[i] * qi) * scale));
++            kn[i] = float(static_cast<InT>(kf[i] * ki));
++            float ai = float(a[(size_t)s * QKV + h * D + lane * NPT + i]) + dtb[i];
++            g[i] = metal::precise::exp(lb * p2_sigmoid(Aexp * ai));
++        }
++        float av = 0.0f;
++        for (int t = 0; t < KS; ++t) av += wv[t] * CI(s + t, cv);
++        InT c3 = static_cast<InT>(av);
++        InT s3 = p2_sigmoid(c3);
++        const float vf = float(static_cast<InT>(c3 * s3));
++        const float beta = float(p2_sigmoid(fused[(size_t)s * CTOT + BOFF + h]));
++
++        float kv = 0.0f;
++        for (int i = 0; i < NPT; ++i) {
++            st[i] = st[i] * g[i];
++            kv += st[i] * kn[i];
++        }
++        kv = simd_sum(kv);
++        const float delta = (vf - kv) * beta;
++        float o = 0.0f;
++        for (int i = 0; i < NPT; ++i) {
++            st[i] = st[i] + kn[i] * delta;
++            o += st[i] * qn[i];
++        }
++        o = simd_sum(o);
++        const size_t ybase = ((size_t)s * H + h) * D;
++        if (lane == 0) {
++            y[ybase + dv] = static_cast<InT>(o);
++            v_out[ybase + dv] = static_cast<InT>(vf);
++        }
++        if (dv == 0) {
++            for (int i = 0; i < NPT; ++i) {
++                q_out[ybase + lane * NPT + i] = static_cast<InT>(qn[i]);
++                k_out[ybase + lane * NPT + i] = static_cast<InT>(kn[i]);
++            }
++        }
++    }
++    for (int i = 0; i < NPT; ++i) state_out[sbase + lane * NPT + i] = st[i];
++    if (lane == 0) {
++        // new conv state = the last KS-1 rows of concat(conv_state, mixed), for this thread's q, k and v channel.
++        const int chans[3] = {(int)(h * D + dv), (int)(QKV + h * D + dv), cv};
++        for (int j = 0; j < 3; ++j)
++            for (int r = 0; r < KS - 1; ++r)
++                conv_out[r * C + chans[j]] = static_cast<InT>(CI(S + r, chans[j]));
++    }
++#undef CI
++"""
++
++_kernel = None
++
++
++def _get_kernel():
++    global _kernel
++    if _kernel is None:
++        _kernel = mx.fast.metal_kernel(
++            name="p2_glm_kda_fused",
++            input_names=["fused", "conv_state", "convw", "a", "A_log", "dt_bias", "state_in", "lower_bound", "T"],
++            output_names=["y", "state_out", "conv_out", "q_out", "k_out", "v_out"],
++            source=_SRC,
++            header=_HEADER,
++        )
++    return _kernel
++
++
++def kda_fused(fused, conv_state, convw, a, A_log, dt_bias, state, lower_bound, num_heads, head_dim):
++    """fused: (1,S,CTOT) in-proj output [q|k|v|f_a|g_a|b]; conv_state (1,KS-1,3*QKV); convw (3*QKV,KS,1); a (1,S,QKV);
++    A_log (H,) f32; dt_bias (QKV,) f32; state (1,H,D,D) f32. Returns y (1,S,H,D), new state, new conv state, q, k, v (1,S,H,D)."""
++    S, CTOT = fused.shape[1], fused.shape[2]
++    H, D = num_heads, head_dim
++    QKV = H * D
++    C = 3 * QKV
++    KS = convw.shape[1]
++    dt = fused.dtype
++    shp = (1, S, H, D)
++    outs = _get_kernel()(
++        inputs=[fused, conv_state, convw, a, A_log.reshape(-1), dt_bias.reshape(-1), state,
++                mx.array([float(lower_bound)], dtype=mx.float32), S],
++        template=[("InT", dt), ("D", D), ("H", H), ("QKV", QKV), ("C", C), ("CTOT", CTOT), ("BOFF", CTOT - H), ("KS", KS)],
++        grid=(32, D, H),
++        threadgroup=(32, 4, 1),
++        output_shapes=[shp, state.shape, (1, KS - 1, C), shp, shp, shp],
++        output_dtypes=[dt, state.dtype, dt, dt, dt, dt],
++    )
++    return outs
+diff --git a/omlx/patches/p2_lookup.py b/omlx/patches/p2_lookup.py
+new file mode 100644
+index 00000000..d6909afd
+--- /dev/null
++++ b/omlx/patches/p2_lookup.py
+@@ -0,0 +1,165 @@
++"""Phase-2 prompt-lookup drafts inside the MTP chain cycle (after mlx-serve #523/#533, MIT).
++
++When the newest committed tokens (ending in the token the next verify starts from) already occurred earlier in the
++prompt or output, with the match running back at least ``NGRAM`` tokens, the next cycle verifies that earlier
++continuation instead of an MTP chain. The MTP head still folds the committed tokens, so its history stays exact.
++
++Acceptance is the engine's own: greedy compares against the target argmax; stochastic uses the Leviathan/Chen rule
++with a one-hot draft distribution (accept with p(x), residual = p without x), so the output distribution is unchanged.
++
++Gate: tokens-per-second EMAs of lookup cycles (per match-length bucket) vs MTP cycles. Lookup cycles are not fed to
++the MTP depth controller. Singleton chain path only (no batched verify, no block drafters).
++
++Env: OMLX_P2_LOOKUP=1 enables; OMLX_P2_LOOKUP_NGRAM (8), OMLX_P2_LOOKUP_MAX (7), OMLX_P2_LOOKUP_MAX_LONG (= MAX), OMLX_P2_LOOKUP_LONG (32),
++OMLX_P2_LOOKUP_GATE (1; 0 = always take a match).
++"""
++from __future__ import annotations
++
++import logging
++import os
++import time
++
++logger = logging.getLogger(__name__)
++
++ENABLED = os.environ.get("OMLX_P2_LOOKUP", "0") == "1"
++NGRAM = int(os.environ.get("OMLX_P2_LOOKUP_NGRAM", "8"))
++MAX_DRAFTS = int(os.environ.get("OMLX_P2_LOOKUP_MAX", "7"))
++# Drafts when the match runs back >= LONG_MATCH tokens (mlx-serve #533 uses 14). Defaults to MAX_DRAFTS: GLM's indexer pool can
++# undo at most an 8-row verify block, so only raise it for models without that limit (Qwen: OMLX_P2_LOOKUP_MAX_LONG=14).
++MAX_LONG = int(os.environ.get("OMLX_P2_LOOKUP_MAX_LONG", str(MAX_DRAFTS)))
++LONG_MATCH = int(os.environ.get("OMLX_P2_LOOKUP_LONG", "32"))
++GATE = os.environ.get("OMLX_P2_LOOKUP_GATE", "1") == "1"
++_ALPHA = 0.15
++_REPROBE = 16  # matched-but-gated opportunities between forced lookup probes
++
++
++class _Lookup:
++    __slots__ = ("idx", "upto", "pending", "pending_bucket", "last_t", "ema_mtp", "ema_lk", "skipped",
++                 "rounds", "drafted", "accepted", "emitted", "gated")
++
++    def __init__(self):
++        self.idx = {}
++        self.upto = 0  # positions < upto have had their n-gram inserted
++        self.pending = False  # the drafts now queued for verify came from lookup
++        self.pending_bucket = 0
++        self.last_t = None
++        self.ema_mtp = None
++        self.ema_lk = [None, None]  # [short match, long match]
++        self.skipped = 0
++        self.rounds = self.drafted = self.accepted = self.emitted = self.gated = 0
++
++
++def _get(state):
++    lk = getattr(state, "_p2_lookup", None)
++    if lk is None:
++        lk = _Lookup()
++        state._p2_lookup = lk
++    return lk
++
++
++def was_pending(state) -> bool:
++    lk = getattr(state, "_p2_lookup", None)
++    return bool(lk is not None and lk.pending)
++
++
++def observe(state, was_lookup: bool, k: int, m: int) -> None:
++    """Credit the cycle that just committed m+1 tokens to its draft source (wall time since the previous commit)."""
++    lk = _get(state)
++    now = time.perf_counter()
++    if lk.last_t is not None:
++        rate = (m + 1) / max(now - lk.last_t, 1e-6)
++        if was_lookup:
++            b = lk.pending_bucket
++            e = lk.ema_lk[b]
++            lk.ema_lk[b] = rate if e is None else e + _ALPHA * (rate - e)
++            lk.rounds += 1
++            lk.drafted += k
++            lk.accepted += m
++            lk.emitted += m + 1
++        elif k > 0:
++            e = lk.ema_mtp
++            lk.ema_mtp = rate if e is None else e + _ALPHA * (rate - e)
++    lk.last_t = now
++    lk.pending = False
++
++
++def propose(gen_batch, state):
++    """Host-side lookup over prompt + committed output. Returns a list of draft ids, or None."""
++    lk = _get(state)
++    base = gen_batch.tokens[0]
++    tail = [q[0] for q in state.queue]
++    nb = len(base)
++    total = nb + len(tail)
++
++    def at(i):
++        return base[i] if i < nb else tail[i - nb]
++
++    n = NGRAM
++    if total <= n:
++        return None
++    # Index every n-gram whose end still has a continuation (end < total - 1).
++    idx = lk.idx
++    start = max(lk.upto, n - 1)
++    if start < total - 1:
++        if start < nb - 1:
++            # Bulk part inside the committed list: slice once instead of per-position lookups.
++            seg = base[start - n + 1 : min(nb, total - 1)]
++            for j in range(len(seg) - n + 1):
++                idx[tuple(seg[j : j + n])] = start + j
++            start = start + max(0, len(seg) - n + 1)
++        for i in range(start, total - 1):
++            idx[tuple(at(t) for t in range(i - n + 1, i + 1))] = i
++        lk.upto = total - 1
++    key = tuple(at(t) for t in range(total - n, total))
++    p = idx.get(key)
++    if p is None:
++        return None
++    # How far back the match runs (bucket for the gate).
++    run = n
++    while run < LONG_MATCH and p - run >= 0 and at(p - run) == at(total - 1 - run):
++        run += 1
++    bucket = 1 if run >= LONG_MATCH else 0
++    cont_end = min(p + 1 + (MAX_LONG if bucket else MAX_DRAFTS), total)
++    drafts = [at(t) for t in range(p + 1, cont_end)]
++    if not drafts:
++        return None
++    if GATE:
++        e_lk, e_mtp = lk.ema_lk[bucket], lk.ema_mtp
++        if e_lk is not None and e_mtp is not None and e_lk < e_mtp:
++            lk.skipped += 1
++            if lk.skipped % _REPROBE:
++                lk.gated += 1
++                return None
++    lk.pending = True
++    lk.pending_bucket = bucket
++    return drafts
++
++
++def set_drafts(state, drafts, vocab: int) -> None:
++    """Install lookup drafts as the next verify block (one-hot draft distributions)."""
++    import mlx.core as mx
++
++    toks = mx.array(drafts, dtype=mx.uint32)
++    onehot = mx.where(
++        mx.arange(vocab, dtype=mx.int32)[None, :] == toks.astype(mx.int32)[:, None],
++        mx.array(0.0, dtype=mx.float32),
++        mx.array(-float("inf"), dtype=mx.float32),
++    )
++    state.drafts = toks
++    # Empty draft_lps → accepted drafts emit the target row as their logprobs (block-drafter contract).
++    state.draft_lps = []
++    state.draft_accept_lps = [onehot[j] for j in range(len(drafts))]
++    mx.async_eval(state.drafts)
++
++
++def log_stats(uid, stats) -> None:
++    lk = getattr(stats, "_p2_lookup_ref", None)
++    if lk is None or not (lk.rounds or lk.gated):
++        return
++    logger.info(
++        "P2-LOOKUP[%s] rounds=%d drafted=%d accepted=%d (%.1f%%) tok/round=%.2f gated=%d ema_mtp=%s ema_lk=%s",
++        uid, lk.rounds, lk.drafted, lk.accepted, 100.0 * lk.accepted / max(lk.drafted, 1),
++        lk.emitted / max(lk.rounds, 1), lk.gated,
++        None if lk.ema_mtp is None else round(lk.ema_mtp, 1),
++        [None if e is None else round(e, 1) for e in lk.ema_lk],
++    )

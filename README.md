@@ -62,6 +62,8 @@ Plan for about 350 GB of disk (GLM ~182 GB + 8.6 GB graft source, Qwen ~147 GB) 
    Use `scripts/serve.sh qwen` for Qwen. Either way the server is an OpenAI-compatible endpoint at `http://127.0.0.1:8000/v1`.
    For Qwen, send `chat_template_kwargs: {"enable_thinking": false}` when you don't want thinking.
 
+**Building oMLX from source?** The patch is also rebased onto oMLX `main` @ f0d8428a, which adds upstream's GLM prefill port: GLM prefill reaches 1,121 / 1,086 tok/s at 8K / 32K with identical KLD. See [docs/OMLX-MAIN.md](docs/OMLX-MAIN.md).
+
 ## Known issues
 
 - **GLM vision:** image requests fail with "More images were provided than image tokens" (the checkpoint's processor). This happens on stock oMLX too.
