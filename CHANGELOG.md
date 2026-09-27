@@ -2,6 +2,8 @@
 
 ## 2026-09-27
 
+- **Vision fixed:** the graft installs the official zai-org chat template (rev eb9eb208). dfp's template is text-only and turned every image into an "unable to process" reminder. All gates pass, vision included.
+- **Batched decode:** HyperConnection mix as a batched matvec (MLX GEMM trap at N=24), fused KDA kernel for B≤4 (bit-exact), FFN compile at B·S ≤ 8. Served c=2 64.7 → 75.3, c=8 103.4 → 109.2. KLD neutral.
 - Lookup gate fix: the first timed cycle at each new verify width is kept out of the tokens/s EMAs. It pays one-off Metal kernel compilation, and one such cold sample had gated short-match lookups off for most of a request (a Qwen edit task measured 242 vs 275 tok/s with identical output). Gate decisions only; output is unchanged.
 - Split out of the combined M5 Ultra recipe into one repository per model (this one is GLM-5.3-Flash).
   Companion: https://github.com/sethforprivacy/Qwen3.8-Flash-Next-M5-Ultra-oMLX

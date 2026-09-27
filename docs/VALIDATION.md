@@ -35,3 +35,11 @@ GLM long-context had passed in all 7 earlier oMLX oQ4e runs, including both patc
 
 Fresh `scripts/install.sh` → `~/omlx-glm-validate`, served by the new `scripts/serve.sh`. Agent mix at T=0 against MTP-only:
 edit 72.8 → 120.1 (1.65×), JSON 79.6 → 121.0 (1.52×), fix 76.0 → 116.0 (1.53×), diff 1.03×, prose 1.00×, new code 0.99×. This reproduces the published gains.
+
+## 2026-09-27: vision fix and batched-decode patches, from scratch
+
+Fresh `scripts/install.sh`, then the graft with `--chat-template` (official zai-org template). Against the development copy, the MTP shard, index and template are all **byte-identical**.
+Served by `scripts/serve.sh`:
+- **reasoning 12/12**
+- **every qualify gate passes, including vision** (it had failed on every earlier run of this checkpoint) and 127K retrieval
+- ladder c=1 · 2 · 4 = 68.2 · 75.0 · 92.4 tok/s

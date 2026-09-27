@@ -16,7 +16,7 @@ Companion recipe: [Qwen3.8-Flash-Next on the same machine](https://github.com/se
 | prefill 8K · 32K · 128K · 256K | 800 · 796 · 778 · 736 | **1,055 · 1,039 · 993 · 901** |
 | decode at 128K context | 20.5 | 32.2 |
 | KLD vs BF16: teacher-forced · decode-path | 0.0347 · 0.0433 | 0.0347 · 0.0433 |
-| reasoning / tool / long-context gates | 12/12 | 12/12 |
+| reasoning / tool / long-context / vision gates | 12/12 · pass · pass · **fail** (checkpoint's text-only template) | 12/12 · pass · pass · **pass** |
 
 On oMLX `main` built from source, prefill reaches 1,121 / 1,086 tok/s at 8K / 32K ([docs/OMLX-MAIN.md](docs/OMLX-MAIN.md)).
 
@@ -31,6 +31,8 @@ On oMLX `main` built from source, prefill reaches 1,121 / 1,086 tok/s at 8K / 32
 | 5 | **Compiled glue at MTP-verify shapes**: the FFN/MoE half for ≤8 rows, plus the KDA decode glue. | −6 % verify step, −4 % decode step |
 | 6 | **KDA as one Metal kernel**, bit-exact against stock. Idea from mlx-serve #517. | −2.3 % decode step |
 | 7 | **Prefill: flush MLX's buffer pool only above 4 GB.** oMLX rc1 flushes it after every layer (#3807), so every layer re-allocates. | **+33 % @32K, +26 % @256K**, lower peak RAM |
+| 8 | **Official chat template** (zai-org, pinned) instead of dfp's text-only one, which breaks every image request. | **vision works** |
+| 9 | **Batched decode:** HyperConnection mix as a batched matvec (MLX's GEMM is 5.5× slower at N=24 for 2+ rows), fused KDA and FFN compile for B>1. | c=2 +16 %, c=8 +6 % |
 
 ## Setup
 
@@ -55,10 +57,9 @@ Plan for about 200 GB of disk (the ~182 GB backbone plus 8.6 GB of graft source)
 
 ## Known issues
 
-- **Vision:** image requests fail with "More images were provided than image tokens" (the checkpoint's processor). This happens on stock oMLX too.
 - **Long-context retrieval with MTP:** in a 127K-token three-code needle test, runs with MTP on dropped the last code 2 times in 15, while MTP off went 11/11. Prompt lookup is not the cause. Details in [docs/VALIDATION.md](docs/VALIDATION.md). Set `"mtp_enabled": false` if that matters more than speed.
 - **Stop token:** the model sometimes emits `<|assistant|>` plus extra text after an answer, with or without this recipe (checkpoint template).
-- **Concurrency:** every speedup here is single-stream (B=1). At 2–8 simultaneous streams it runs at about stock speed (c=8 ≈ 103 tok/s aggregate).
+- **Concurrency:** prompt lookup and most kernels are single-stream. Batched decode gets the B>1 fixes (row 9): c=2 75 tok/s, c=8 109 tok/s aggregate.
 - **Greedy text** is not byte-identical to plain decoding, with or without this patch, because oMLX's multi-row verify rounds differently.
 
 ## Credits and license

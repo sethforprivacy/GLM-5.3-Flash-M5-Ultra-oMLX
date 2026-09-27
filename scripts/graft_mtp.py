@@ -10,13 +10,21 @@ them as mtp.0.* exactly as it does for the donor checkpoint.
 The donor's quant must match the target's default quant (both 4-bit gs64 affine here), since the grafted paths carry
 no per-path override in the target's config.json.
 
-usage: graft_mtp.py TARGET_DIR DONOR_DIR OUT_DIR   (run with an interpreter that has mlx)
+usage: graft_mtp.py TARGET_DIR DONOR_DIR OUT_DIR [--chat-template FILE]   (run with an interpreter that has mlx)
+
+--chat-template replaces the symlinked chat_template.jinja with FILE. dfp's template is text-only: it turns image parts into an
+"unable to process this image" reminder, so oMLX fails with "More images were provided than image tokens". Pass the upstream
+zai-org/GLM-5.3-Flash template to restore vision.
 """
 import json, os, sys
 from pathlib import Path
 import mlx.core as mx
 
-target, donor, out = (Path(os.path.expanduser(p)) for p in sys.argv[1:4])
+args = sys.argv[1:]
+template = None
+if "--chat-template" in args:
+    i = args.index("--chat-template"); template = Path(os.path.expanduser(args[i + 1])); del args[i:i + 2]
+target, donor, out = (Path(os.path.expanduser(p)) for p in args[:3])
 tcfg = json.loads((target / "config.json").read_text())
 dcfg = json.loads((donor / "config.json").read_text())
 tq = tcfg.get("quantization") or tcfg.get("quantization_config")
@@ -55,4 +63,10 @@ meta = dict(tidx.get("metadata", {}))
 meta["total_size"] = int(meta.get("total_size", 0)) + sum(v.nbytes for v in graft.values())
 meta["mtp_graft"] = f"layer {n_main} from {donor.name} ({', '.join(shards)})"
 (out / "model.safetensors.index.json").write_text(json.dumps({"metadata": meta, "weight_map": wm}, indent=2))
+if template is not None:
+    dst = out / "chat_template.jinja"
+    if dst.is_symlink() or dst.exists():
+        dst.unlink()
+    dst.write_text(template.read_text())
+    print("chat template replaced from", template)
 print("wrote", out)

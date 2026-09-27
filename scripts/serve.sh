@@ -9,7 +9,8 @@ port=${2:-8000}
 omlx=${OMLX_RECIPE_TREE:-$HOME/omlx-glm-m5ultra}
 
 export OMLX_GLM_INDEXER_MLX_MAX_ROWS=8 OMLX_GLM_COMPILE_KDA=1 OMLX_GLM_KDA_FUSED=1 OMLX_GLM_COMPILE_FFN_MAX_S=8 \
-       OMLX_GLM_PREFILL_SYNC=cache:4 OMLX_P2_LOOKUP=1
+       OMLX_GLM_PREFILL_SYNC=cache:4 OMLX_P2_LOOKUP=1 \
+       OMLX_P2_HC_GEMV=1 OMLX_GLM_KDA_FUSED_MAX_B=4 OMLX_GLM_COMPILE_FFN_BATCH=1
 settings=$here/../configs/model_settings.glm.json
 
 mkdir -p ~/.omlx

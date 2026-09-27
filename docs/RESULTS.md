@@ -47,3 +47,12 @@ Unless noted, decode tok/s comes from the wall-time difference between 32- and 5
 **Decode step** (unsynced, 4K context): L=1 28.9 → 25.0 ms and L=3 verify ~40 → 37.4 ms, across indexer routing, compiled glue, the fused KDA kernel and FFN compile.
 At 128K context L=1 goes 37.5 → 27.4 ms (indexer routing). One decode token reads 13.3 GB of weights (≈14.8 ms at 0.9 TB/s).
 
+
+**Batched decode** (served ladder, aggregate tok/s; decode-path KLD with 2 and 4 duplicate sequences: 0.0434, 0.0439, against 0.0433 at 1):
+
+| streams | before the B>1 fixes | with them |
+|---|---|---|
+| 1 | 68.7 | 67.8 |
+| 2 | 64.7 | 75.3 |
+| 4 | 87.7 | 91.8 |
+| 8 | 103.4 | 109.2 |

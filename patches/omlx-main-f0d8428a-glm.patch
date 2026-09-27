@@ -97,10 +97,35 @@ index 71075fb9..05a49432 100644
              keepalive = bool(getattr(state.mtp_cache, "fold_keepalive", False))
              if keepalive:
 diff --git a/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py b/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py
-index b2f9e834..15008f33 100644
+index b2f9e834..4f21424f 100644
 --- a/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py
 +++ b/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py
-@@ -30,6 +30,39 @@ from .linear import fused_quantized_matmul, linear_forward
+@@ -12,6 +12,24 @@ from ..base import (
+ )
+ from ..cache import ArraysCache, CacheList, KVCache
+ from ..deepseek_v4.hyper_connection import HyperConnection, hc_expand
++
++import os as _p2hc_os
++
++# Phase-2 (mac-studio-m5-ultra): HyperConnection._mix is an fp32 (B, L, hc*hidden) @ (hc*hidden, 24) product. mlx-vlm splits it
++# per token for B=1 verify blocks, but for B>1 it runs `z @ fn.T`. There MLX leaves its matvec kernel for a GEMM that handles N=24
++# badly: 22 us at 1 row -> ~120 us at 2-8 rows on M5 Ultra, over 90 calls per step. A batched matvec stays ~17-19 us.
++if _p2hc_os.environ.get("OMLX_P2_HC_GEMV", "0") == "1" and not getattr(HyperConnection, "_p2_hc_gemv", False):
++    _p2_orig_mix = HyperConnection._mix
++
++    def _p2_hc_mix(self, z):
++        if z.shape[0] > 1 and not self.training and z.shape[1] <= 64:
++            rows = int(z.shape[0]) * int(z.shape[1])
++            flat = z.reshape(rows, z.shape[-1])
++            return (self.fn @ flat[..., None]).squeeze(-1).reshape(z.shape[0], z.shape[1], self.fn.shape[0])
++        return _p2_orig_mix(self, z)
++
++    HyperConnection._mix = _p2_hc_mix
++    HyperConnection._p2_hc_gemv = True
+ from mlx_lm.models.mla import MultiLinear
+ from omlx.patches import glm53_kda_prework
+ from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
+@@ -30,6 +48,42 @@ from .linear import fused_quantized_matmul, linear_forward
  
  logger = logging.getLogger(__name__)
  _NATIVE_INDEXER_WARNED = False
@@ -111,6 +136,9 @@ index b2f9e834..15008f33 100644
 +# Phase-2: compile the FFN half for B=1 up to this many rows (stock: 1). MTP verify blocks (2-8 rows) otherwise run the
 +# 288-expert MoE glue eagerly; one trace per row count.
 +_COMPILE_FFN_MAX_S = int(_os.environ.get("OMLX_GLM_COMPILE_FFN_MAX_S", "1"))
++# Phase-2: also compile the FFN half for small batches (B * S <= _COMPILE_FFN_MAX_S). The stock comment warns of memory spikes at
++# batched/prefill shapes; this stays opt-in.
++_COMPILE_FFN_BATCH = _os.environ.get("OMLX_GLM_COMPILE_FFN_BATCH", "0") == "1"
 +
 +# Phase-2 (mac-studio-m5-ultra): rc1 added mx.eval + mx.clear_cache after every layer of every prefill chunk (bounding memory);
 +# 0.7.0.dev2 stayed lazy. OMLX_GLM_PREFILL_SYNC: "layer" (stock rc1), "eval" (per-layer eval, keep the buffer cache),
@@ -140,7 +168,7 @@ index b2f9e834..15008f33 100644
  
  
  def _cache_parts(cache):
-@@ -216,6 +249,73 @@ class Glm5NextLinearAttention(nn.Module):
+@@ -216,6 +270,74 @@ class Glm5NextLinearAttention(nn.Module):
              out = inputs @ self._fw.T
          return mx.split(out, self._split_pts, axis=-1)
  
@@ -198,8 +226,9 @@ index b2f9e834..15008f33 100644
 +        # Needs the single fused in-projection: oQ mixed-bit layers whose q/k/v/f_a/g_a/b differ in bits fall back to separate
 +        # matmuls in _fused_in_proj (no _fw), and take the compiled path instead.
 +        return (_kf.ENABLED and self.fuse_in and getattr(self, "_fused_ready", False) and getattr(self, "_fq", False)
-+                and self.kda_compiled_ok(inputs, mask, cache) and self.forget_gate.safe_gate_lower_bound is not None
-+                and self.head_dim == 128)
++                and inputs.shape[0] <= _kf.MAX_B and inputs.shape[1] <= 8 and mask is None
++                and cache is not None and cache[0] is not None and cache.lengths is None
++                and self.forget_gate.safe_gate_lower_bound is not None and self.head_dim == 128)
 +
 +    def kda_compiled_ok(self, inputs, mask, cache):
 +        return (_COMPILE_KDA and inputs.shape[0] == 1 and inputs.shape[1] <= 8 and mask is None
@@ -214,7 +243,7 @@ index b2f9e834..15008f33 100644
      def __call__(
          self,
          inputs: mx.array,
-@@ -225,6 +325,18 @@ class Glm5NextLinearAttention(nn.Module):
+@@ -225,6 +347,18 @@ class Glm5NextLinearAttention(nn.Module):
          B, S, _ = inputs.shape
          if glm53_kda_prework.glm53_kda_prefill_eligible(self, inputs, mask, cache):
              return glm53_kda_prework.glm53_kda_prefill(self, inputs, cache)
@@ -233,7 +262,7 @@ index b2f9e834..15008f33 100644
          has_right_padding = cache is not None and cache.lengths is not None
          if has_right_padding:
              mask = mx.arange(S)[None] < cache.lengths[:, None]
-@@ -350,6 +462,11 @@ class Glm5NextIndexer(nn.Module):
+@@ -350,6 +484,11 @@ class Glm5NextIndexer(nn.Module):
  
      def _native_scores(self, q, pool_keys, weights):
          global _NATIVE_INDEXER_WARNED
@@ -245,16 +274,17 @@ index b2f9e834..15008f33 100644
          if (
              q.shape[2] != self.n_heads
              or self.n_heads != 32
-@@ -958,7 +1075,7 @@ class Glm5NextDecoderLayer(nn.Module):
+@@ -958,7 +1097,8 @@ class Glm5NextDecoderLayer(nn.Module):
          # was validated on and where its win lives. Compiling the 288-expert MoE at a
          # batched or prefill shape spikes memory (it can OOM alongside the resident
          # weights), so those shapes take the eager path.
 -        if self.compile_ffn and x.shape[0] == 1 and x.shape[1] == 1:
-+        if self.compile_ffn and x.shape[0] == 1 and x.shape[1] <= _COMPILE_FFN_MAX_S:
++        if self.compile_ffn and ((x.shape[0] == 1 and x.shape[1] <= _COMPILE_FFN_MAX_S)
++                                 or (_COMPILE_FFN_BATCH and x.shape[0] * x.shape[1] <= _COMPILE_FFN_MAX_S)):
              if self._ffn_c is None:
                  self._ffn_c = mx.compile(self._ffn_block)
              return self._ffn_c(x)
-@@ -1012,12 +1129,11 @@ class Glm5NextModel(nn.Module):
+@@ -1012,12 +1152,11 @@ class Glm5NextModel(nn.Module):
          # Keep decode lazy; the MTP replacement loop must use the same policy.
          prefill = h.shape[1] >= 256
  
@@ -317,11 +347,11 @@ index 74d9eb1c..6f2534c1 100644
          # norm, the lm_head, and the nextn head) consumes the ordinary
 diff --git a/omlx/patches/p2_kda_fused.py b/omlx/patches/p2_kda_fused.py
 new file mode 100644
-index 00000000..fe3f1568
+index 00000000..918923c9
 --- /dev/null
 +++ b/omlx/patches/p2_kda_fused.py
-@@ -0,0 +1,162 @@
-+"""Phase-2 (mac-studio-m5-ultra): GLM-5.3 KDA decode/verify as one Metal dispatch (B=1, S<=8).
+@@ -0,0 +1,166 @@
++"""Phase-2 (mac-studio-m5-ultra): GLM-5.3 KDA decode/verify as one Metal dispatch (B>=1, S<=8).
 +
 +Replaces, per KDA layer: concat(q,k,v) → conv1d → silu → split → l2norm(q)·scale, l2norm(k) → compute_g_safe → sigmoid(b) →
 +gated-delta recurrence, plus the conv-state update. That's ~17 dispatches down to 1. It reads q/k/v/b straight out of the fused
@@ -337,6 +367,8 @@ index 00000000..fe3f1568
 +import mlx.core as mx
 +
 +ENABLED = os.environ.get("OMLX_GLM_KDA_FUSED", "0") == "1"
++# Largest batch the fused path takes (each sequence runs its own recurrence; grid z = B * heads).
++MAX_B = int(os.environ.get("OMLX_GLM_KDA_FUSED_MAX_B", "1"))
 +
 +# Same functor bodies as MLX's Metal unary ops (unary_ops.h), so rounding matches the stock graph op for op.
 +_HEADER = r"""
@@ -348,14 +380,16 @@ index 00000000..fe3f1568
 +
 +_SRC = r"""
 +    constexpr int NPT = D / 32;
-+    const uint h = thread_position_in_grid.z;
++    const uint bz = thread_position_in_grid.z;
++    const uint b = bz / H;
++    const uint h = bz % H;
 +    const uint dv = thread_position_in_grid.y;
 +    const uint lane = thread_index_in_simdgroup;
 +    const int S = T;
 +    const float scale = metal::rsqrt(float(D));
 +    const float lb = lower_bound[0];
 +
-+#define CI(r, c) ((r) < KS - 1 ? float(conv_state[(r) * C + (c)]) : float(fused[((r) - (KS - 1)) * CTOT + (c)]))
++#define CI(r, c) ((r) < KS - 1 ? float(conv_state[((size_t)b * (KS - 1) + (r)) * C + (c)]) : float(fused[((size_t)b * S + (r) - (KS - 1)) * CTOT + (c)]))
 +
 +    float wq[NPT][KS], wk[NPT][KS], wv[KS], dtb[NPT], st[NPT];
 +    int cq[NPT], ck[NPT];
@@ -373,7 +407,7 @@ index 00000000..fe3f1568
 +    for (int t = 0; t < KS; ++t) wv[t] = float(convw[cv * KS + t]);
 +    const float Aexp = metal::precise::exp(float(A_log[h]));
 +
-+    const size_t sbase = ((size_t)h * D + dv) * D;
++    const size_t sbase = (((size_t)b * H + h) * D + dv) * D;
 +    for (int i = 0; i < NPT; ++i) st[i] = float(state_in[sbase + lane * NPT + i]);
 +
 +    for (int s = 0; s < S; ++s) {
@@ -401,7 +435,7 @@ index 00000000..fe3f1568
 +        for (int i = 0; i < NPT; ++i) {
 +            qn[i] = float(static_cast<InT>((qf[i] * qi) * scale));
 +            kn[i] = float(static_cast<InT>(kf[i] * ki));
-+            float ai = float(a[(size_t)s * QKV + h * D + lane * NPT + i]) + dtb[i];
++            float ai = float(a[((size_t)b * S + s) * QKV + h * D + lane * NPT + i]) + dtb[i];
 +            g[i] = metal::precise::exp(lb * p2_sigmoid(Aexp * ai));
 +        }
 +        float av = 0.0f;
@@ -409,7 +443,7 @@ index 00000000..fe3f1568
 +        InT c3 = static_cast<InT>(av);
 +        InT s3 = p2_sigmoid(c3);
 +        const float vf = float(static_cast<InT>(c3 * s3));
-+        const float beta = float(p2_sigmoid(fused[(size_t)s * CTOT + BOFF + h]));
++        const float beta = float(p2_sigmoid(fused[((size_t)b * S + s) * CTOT + BOFF + h]));
 +
 +        float kv = 0.0f;
 +        for (int i = 0; i < NPT; ++i) {
@@ -424,7 +458,7 @@ index 00000000..fe3f1568
 +            o += st[i] * qn[i];
 +        }
 +        o = simd_sum(o);
-+        const size_t ybase = ((size_t)s * H + h) * D;
++        const size_t ybase = (((size_t)b * S + s) * H + h) * D;
 +        if (lane == 0) {
 +            y[ybase + dv] = static_cast<InT>(o);
 +            v_out[ybase + dv] = static_cast<InT>(vf);
@@ -442,7 +476,7 @@ index 00000000..fe3f1568
 +        const int chans[3] = {(int)(h * D + dv), (int)(QKV + h * D + dv), cv};
 +        for (int j = 0; j < 3; ++j)
 +            for (int r = 0; r < KS - 1; ++r)
-+                conv_out[r * C + chans[j]] = static_cast<InT>(CI(S + r, chans[j]));
++                conv_out[((size_t)b * (KS - 1) + r) * C + chans[j]] = static_cast<InT>(CI(S + r, chans[j]));
 +    }
 +#undef CI
 +"""
@@ -466,20 +500,20 @@ index 00000000..fe3f1568
 +def kda_fused(fused, conv_state, convw, a, A_log, dt_bias, state, lower_bound, num_heads, head_dim):
 +    """fused: (1,S,CTOT) in-proj output [q|k|v|f_a|g_a|b]; conv_state (1,KS-1,3*QKV); convw (3*QKV,KS,1); a (1,S,QKV);
 +    A_log (H,) f32; dt_bias (QKV,) f32; state (1,H,D,D) f32. Returns y (1,S,H,D), new state, new conv state, q, k, v (1,S,H,D)."""
-+    S, CTOT = fused.shape[1], fused.shape[2]
++    B, S, CTOT = fused.shape
 +    H, D = num_heads, head_dim
 +    QKV = H * D
 +    C = 3 * QKV
 +    KS = convw.shape[1]
 +    dt = fused.dtype
-+    shp = (1, S, H, D)
++    shp = (B, S, H, D)
 +    outs = _get_kernel()(
 +        inputs=[fused, conv_state, convw, a, A_log.reshape(-1), dt_bias.reshape(-1), state,
 +                mx.array([float(lower_bound)], dtype=mx.float32), S],
 +        template=[("InT", dt), ("D", D), ("H", H), ("QKV", QKV), ("C", C), ("CTOT", CTOT), ("BOFF", CTOT - H), ("KS", KS)],
-+        grid=(32, D, H),
++        grid=(32, D, B * H),
 +        threadgroup=(32, 4, 1),
-+        output_shapes=[shp, state.shape, (1, KS - 1, C), shp, shp, shp],
++        output_shapes=[shp, state.shape, (B, KS - 1, C), shp, shp, shp],
 +        output_dtypes=[dt, state.dtype, dt, dt, dt, dt],
 +    )
 +    return outs
