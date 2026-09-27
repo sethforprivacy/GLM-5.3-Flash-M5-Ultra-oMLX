@@ -18,7 +18,7 @@ Companion recipe: [Qwen3.8-Flash-Next on the same machine](https://github.com/se
 | KLD vs BF16: teacher-forced · decode-path | 0.0347 · 0.0433 | 0.0347 · 0.0433 |
 | reasoning / tool / long-context / vision gates | 12/12 · pass · pass · **fail** (checkpoint's text-only template) | 12/12 · pass · pass · **pass** |
 
-On oMLX `main` built from source, prefill reaches 1,121 / 1,086 tok/s at 8K / 32K ([docs/OMLX-MAIN.md](docs/OMLX-MAIN.md)).
+On oMLX `main` built from source, prefill reaches 1,121 / 1,086 tok/s at 8K / 32K. Adding the open upstream prefill PRs #3985/#3986/#3988 takes it to **1,218 / 1,245 / 1,256 tok/s at 8K / 32K / 128K** with identical KLD ([docs/OMLX-MAIN.md](docs/OMLX-MAIN.md)).
 
 ## What changes, and why
 

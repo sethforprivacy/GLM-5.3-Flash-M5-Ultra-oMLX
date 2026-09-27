@@ -32,3 +32,24 @@ python -c "from omlx.custom_kernels import native_kernel_status as s; print({k: 
 - `nanobind` must match the ABI MLX 0.32.2 was built with.
 
 Serve with the same flags and environment as `scripts/serve.sh`, replacing the binary with `~/omlx-src/.venv/bin/omlx serve`.
+
+## Experimental: add the open upstream prefill PRs (#3985, #3986, #3988)
+
+jonathan308's open oMLX PRs add a tensor-unit DSA indexer (#3985), a tensor-unit sparse-MLA prefill kernel (#3986) and 8K prefill chunks on NAX hosts (#3988).
+They target GLM-5.3's biggest prefill cost: the classic-SIMD sparse-MLA kernel took 224 ms per layer for an 8K chunk at 32K context.
+On top of this recipe's `main` patch (same box, our harness):
+
+| served prefill, tok/s | 8K | 32K | 128K |
+|---|---|---|---|
+| main + recipe patch | 1,093 | 1,094 | 1,038 |
+| **+ #3985 #3986 #3988** | **1,218** | **1,245** | **1,256** |
+
+KLD is identical (teacher-forced 0.0347 / top-1 0.9416), and reasoning 12/12 plus every qualify gate, vision included, pass. To try it after the build steps above:
+
+```bash
+cd ~/omlx-src
+git fetch origin pull/3985/head:pr-3985 pull/3986/head:pr-3986 pull/3988/head:pr-3988
+git merge --no-edit pr-3985 pr-3986 pr-3988   # pure Python/Metal-JIT changes; no rebuild needed
+```
+
+They are open PRs, so re-check before relying on them. Once they merge upstream, this step goes away.
