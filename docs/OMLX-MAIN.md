@@ -1,3 +1,7 @@
+> **History.** This page records how the `main` profile evolved: v1 (milestone 3), then v2 (milestone 4). The current recommended profile is **v3**:
+> `main` + `patches/upstream-omlx-glm53-stack.patch` + `patches/omlx-main-glm-on-stack.patch`, built by `scripts/install.sh` (README; docs/VALIDATION.md).
+> The patch files named below were replaced in v3; they remain in this repository's git history.
+
 # oMLX `main` from source: how the recommended profile was reached
 
 Step 3 (2026-09-27 evening): three more patches in `patches/omlx-main-f0d8428a-glm.patch` (HC pre-mix, KDA prefill in-place q/k/v, KDA recurrence); see the README rows 11–13 and docs/VALIDATION.md.

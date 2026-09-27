@@ -1,6 +1,6 @@
 #!/bin/zsh
-# RECOMMENDED profile (milestone 3): oMLX main @ f0d8428a built from source, with this recipe's patch and the upstream GLM-5.3
-# prefill PRs #3985/#3986/#3988 (pinned as a patch), native Metal kernels included.
+# RECOMMENDED profile (v3): oMLX main @ f0d8428a built from source, plus jonathan308's open GLM-5.3 PR stack (16 PRs, pinned as
+# one patch: see CREDITS.md for the PR heads) and this recipe's small patch on top (prompt-lookup MTP, B>1 HC mix). Native kernels included.
 #   scripts/install.sh [~/omlx-glm-src]
 # Needs git, Xcode (with its Metal toolchain) and Python 3.11-3.13.
 set -euo pipefail
@@ -14,9 +14,10 @@ xcrun -f metal >/dev/null 2>&1 || { echo "need Xcode's Metal toolchain (xcrun me
 git clone -q https://github.com/jundot/omlx.git $dest
 cd $dest
 git checkout -q f0d8428a
-git apply $here/../patches/omlx-main-f0d8428a-glm.patch
-git apply $here/../patches/upstream-omlx-prs-3985-3986-3988.patch
-git add -A && git -c user.name=recipe -c user.email=recipe@localhost commit -q -m "recipe patch + upstream PRs #3985/#3986/#3988"
+git apply $here/../patches/upstream-omlx-glm53-stack.patch
+git add -A && git -c user.name=recipe -c user.email=recipe@localhost commit -q -m "upstream GLM-5.3 PR stack (jonathan308)"
+git apply $here/../patches/omlx-main-glm-on-stack.patch
+git add -A && git -c user.name=recipe -c user.email=recipe@localhost commit -q -m "mac-studio-m5-ultra recipe patch"
 $py -m venv .venv
 . .venv/bin/activate
 python -m pip install -q --upgrade pip

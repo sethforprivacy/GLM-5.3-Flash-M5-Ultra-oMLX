@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-09-27 (night): recommended profile v3
+
+- **The recommended build is now oMLX `main` + jonathan308's open GLM-5.3 PR stack (16 PRs, pinned in `patches/upstream-omlx-glm53-stack.patch`) + a small recipe patch**
+  (`patches/omlx-main-glm-on-stack.patch`: prompt-lookup MTP, batched HC mix for 2+ streams). Validated from scratch; the PRs' 424 GLM tests pass.
+- Prefill 1,939 · 2,211 · 2,292 · 2,103 · 1,905 tok/s at 2K–256K (v2: 1,255 · 1,335 · 1,412 · 1,375 · 1,268), fresh decode 77–79 (71), agent edit turns 133–144 (119–128), c=8 115 (109).
+- v2's HC fusion, KDA no-concat and KDA recurrence patches are dropped: upstream #4026 and #3984 cover the same ground, further along.
+- KLD: identical to stock in exact fp32. At MLX defaults the decode-path panel reads 0.0482 against 0.0433, bisected to #3983 computing the HC mix in exact fp32 instead of TF32 (README, Quality).
+
 ## 2026-09-27 (evening)
 
 - **Recommended profile v2 (milestone 4):** three more patches on oMLX `main`, all env-gated and validated from scratch:

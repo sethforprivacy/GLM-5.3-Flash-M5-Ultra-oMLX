@@ -82,3 +82,24 @@ With MTP on and `max_tokens` 512 the test passed **10/10**, all ending on `stop`
 | reasoning · qualify gates | 12/12 · all pass (vision, tool, 127K retrieval) | 12/12 · all pass |
 
 KLD with the new decode and prefill paths: teacher-forced 0.0345 / top-1 0.9419, decode-path 0.0427 (1-token) and 0.0423 (3-token), against 0.0347 / 0.0433 / 0.0441.
+
+## 2026-09-27: recommended profile v3 (upstream GLM-5.3 PR stack + recipe patch), from scratch
+
+1. `scripts/install.sh` into a fresh tree: every native kernel loads, and the tree is **identical** to the development branch (`glm-stack-p2`).
+   The PRs' GLM test suites in that tree: **424 passed, 1 skipped**.
+2. Full cell through `scripts/serve.sh`:
+
+| | v3 from scratch | v2 from scratch |
+|---|---|---|
+| decode fresh greedy (pass 1 · 2) | 77.4 · 79.4 | 71.2 · 73.2 |
+| prefill 2K · 8K · 32K · 128K · 256K | **1,939 · 2,211 · 2,292 · 2,103 · 1,905** | 1,255 · 1,335 · 1,412 · 1,375 · 1,268 |
+| warm follow-up 8K · 32K | 0.30 s · 0.47 s | 0.39 s · 0.51 s |
+| ladder c=1 · 2 · 4 · 8 | 82.8 · 79.0 · 100.3 · 115.1 | 70.9 · 75.6 · 94.2 · 108.9 |
+| agent mix T=0: edit · JSON · fix · diff · prose · new code | 143.2 · 144.4 · 132.8 · 72.8 · 62.5 · 81.3 | 126.0 · 127.9 · 119.0 · 76.0 · 58.1 · 75.3 |
+| agent mix T=0.6: edit · JSON · fix | 147.0 · 143.7 · 123.7 | 127.1 · 126.4 · 120.6 |
+| reasoning · qualify gates | 12/12 · all pass (vision, tool, 127K retrieval) | 12/12 · all pass |
+
+3. KLD (fresh tree): teacher-forced 0.0361 / top-1 0.9405, decode-path 0.0482 (1-token) and 0.0476 (3-token).
+   - **Bisect:** decode-path KLD over the merge sequence gives 0.0433 through #3971, and 0.0482 from #3983 on. Turning #3983 off (`OMLX_GLM_HC_PREFILL=0`) restores teacher-forced 0.0347 exactly.
+   - **TF32 off:** with MLX TF32 off, stock `main` and v3 are identical (decode-path 0.0482, teacher-forced 0.0345), so #3983's exact-fp32 HC mix matches exact-fp32 stock.
+   - **Toggles:** decode fusion, gate/up fusion, the P×V split and the NAX indexer each leave KLD bit-identical.
