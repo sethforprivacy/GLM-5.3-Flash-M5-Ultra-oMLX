@@ -66,3 +66,19 @@ With MTP on and `max_tokens` 512 the test passed **10/10**, all ending on `stop`
 | ladder c=1 · 2 · 4 · 8 | 69.1 · 75.1 · 90.1 · 109.0 | 69 · 73 · 90 · 108 |
 | reasoning · qualify gates | 12/12 · all pass (vision, tool, 127K retrieval) | 12/12 · all pass |
 | peak RAM | 200.8 GB | |
+
+## 2026-09-27: recommended profile v2 (milestone 4), from scratch
+
+`scripts/install.sh` into a fresh tree: every native kernel loads, and the tree is **identical** to the development branch (`p3-plus-prs`). Full cell through `scripts/serve.sh`:
+
+| | from scratch v2 | v1 (milestone 3) from scratch |
+|---|---|---|
+| decode fresh greedy (pass 1 · 2) | 71.2 · 73.2 | 68.9 · 66.6 |
+| prefill 2K · 8K · 32K · 128K · 256K | **1,255 · 1,335 · 1,412 · 1,375 · 1,268** | 1,219 · 1,213 · 1,245 · 1,265 · 1,196 |
+| warm follow-up 8K · 32K | 0.39 s · 0.51 s | 0.39 s · 0.51 s |
+| ladder c=1 · 2 · 4 · 8 | 70.9 · 75.6 · 94.2 · 108.9 | 69.1 · 75.1 · 90.1 · 109.0 |
+| agent mix T=0: edit · JSON · fix · diff · prose · new code | 126.0 · 127.9 · 119.0 · 76.0 · 58.1 · 75.3 | 119.7 · 121.1 · 113.9 · 62.4 · 51.2 · 68.4 (back-to-back run) |
+| agent mix T=0.6: edit · JSON · fix | 127.1 · 126.4 · 120.6 | |
+| reasoning · qualify gates | 12/12 · all pass (vision, tool, 127K retrieval) | 12/12 · all pass |
+
+KLD with the new decode and prefill paths: teacher-forced 0.0345 / top-1 0.9419, decode-path 0.0427 (1-token) and 0.0423 (3-token), against 0.0347 / 0.0433 / 0.0441.

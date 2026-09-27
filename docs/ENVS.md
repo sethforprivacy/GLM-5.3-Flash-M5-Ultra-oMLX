@@ -1,7 +1,7 @@
 # Environment toggles
 
 Every change is an environment variable read at server start. Unset means stock oMLX behaviour (0.7.0rc1, or main @ f0d8428a for the recommended profile).
-The same variables and values apply to both profiles; `scripts/serve.sh` and `scripts/serve-dmg.sh` set all of them.
+`scripts/serve.sh` sets all of them. The DMG profile's patch has every row except the three marked *recommended profile only*, and `scripts/serve-dmg.sh` sets those.
 The upstream PRs in the recommended profile (#3985/#3986/#3988) add no variables: their kernels and 8K chunks switch on by themselves on M5-class (NAX) GPUs.
 
 | Variable | Recipe value | Stock | What it does | Evidence |
@@ -15,6 +15,9 @@ The upstream PRs in the recommended profile (#3985/#3986/#3988) add no variables
 | `OMLX_P2_HC_GEMV` | `1` | `0` | For B>1, computes the HyperConnection mix as a batched matvec. MLX's GEMM path is 5.5× slower at N=24 for 2+ rows. | B=2 step −23 %; served c=2 +16 %; KLD 0.0436 at B=2 |
 | `OMLX_GLM_KDA_FUSED_MAX_B` | `4` | `1` | Lets the fused KDA kernel take batches up to B (grid z = B·heads). Bit-exact. | B=2 step −3 % |
 | `OMLX_GLM_COMPILE_FFN_BATCH` | `1` | `0` | Compiles the FFN half for small batches too (B·S ≤ `OMLX_GLM_COMPILE_FFN_MAX_S`). Peak memory unchanged. | B=2 step −6 % |
+| `OMLX_P2_HC_FUSED` | `1` | `0` | *(recommended profile only)* HyperConnection pre-mix + its RMSNorm in two dispatches at ≤ `OMLX_P2_HC_FUSED_MAX_ROWS` (8) rows: a mix kernel with one threadgroup per output, then mlx-vlm's `exact_hc_norm`. Bit-exact at one row. | decode step −5 %, MTP verify step −6.4 %; agent turns +5–13 % |
+| `OMLX_P2_KDA_NOCONCAT` | `1` | `0` | *(recommended profile only)* KDA prefill prework reads q/k/v in place from the fused in-projection instead of a concatenated copy (~400 MB per layer per 8K chunk). Bit-exact. | prefill +7–14 % at 8K–128K |
+| `OMLX_P2_KDA_REC_DKT` | `16` | `0` | *(recommended profile only)* KDA prefill recurrence with 16 state elements per thread and 8-lane reductions instead of 4 and 32. Chunks of ≥ `OMLX_P2_KDA_REC_MIN_T` (16) tokens only. | recurrence 2.3× faster; prefill a further +4–6 % with `NOCONCAT` |
 
 Model settings (`configs/model_settings.glm.json`, installed by both serve scripts): MTP on, fixed depth 2.
 

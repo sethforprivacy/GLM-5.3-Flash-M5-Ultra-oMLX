@@ -605,10 +605,10 @@ index 00000000..6565a687
 +    )[0]
 +    return out[None]
 diff --git a/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py b/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py
-index 4f21424f..6f99a797 100644
+index bbf3acdf..91f0cc4e 100644
 --- a/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py
 +++ b/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py
-@@ -33,6 +33,7 @@ if _p2hc_os.environ.get("OMLX_P2_HC_GEMV", "0") == "1" and not getattr(HyperConn
+@@ -47,6 +47,7 @@ def _p2_hc_pre(hc, norm, x):
  from mlx_lm.models.mla import MultiLinear
  from omlx.patches import glm53_kda_prework
  from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
@@ -616,7 +616,7 @@ index 4f21424f..6f99a797 100644
  from omlx.patches.glm_moe_dsa.deepseek_v32 import (
      Model as DSV32Model,
      group_expert_select,
-@@ -42,6 +43,11 @@ from omlx.patches.glm_moe_dsa.sparse_mla import (
+@@ -56,6 +57,11 @@ from omlx.patches.glm_moe_dsa.sparse_mla import (
      q8_vup_flat,
      sparse_mla_attention,
  )
@@ -628,7 +628,7 @@ index 4f21424f..6f99a797 100644
  from .config import ModelConfig, TextConfig
  from .gated_delta import gated_delta_update
  from .linear import fused_quantized_matmul, linear_forward
-@@ -570,6 +576,7 @@ class Glm5NextIndexer(nn.Module):
+@@ -587,6 +593,7 @@ class Glm5NextIndexer(nn.Module):
                  valid_cur = mx.ones((B, S), dtype=mx.bool_)
                  total_max = after
          else:
@@ -636,7 +636,7 @@ index 4f21424f..6f99a797 100644
              before_a = mx.zeros((B,), dtype=mx.int32)
              valid_cur = mx.ones((B, S), dtype=mx.bool_)
              usable = (S // self.index_kpool) * self.index_kpool
-@@ -599,8 +606,30 @@ class Glm5NextIndexer(nn.Module):
+@@ -616,8 +623,30 @@ class Glm5NextIndexer(nn.Module):
          tail_on = self.index_kpool_always_select_tail and self.index_kpool > 1
          output_width = self.index_topk + (self.index_kpool - 1 if tail_on else 0)
  
@@ -668,7 +668,7 @@ index 4f21424f..6f99a797 100644
          out = []
          for c0 in range(score_from, S, chunk):
              c1 = min(c0 + chunk, S)
-@@ -608,25 +637,48 @@ class Glm5NextIndexer(nn.Module):
+@@ -625,25 +654,48 @@ class Glm5NextIndexer(nn.Module):
              q_chunk = q[:, c0:c1]
              weights = linear_forward(self.weights_proj, x[:, c0:c1])
              weights = (weights * self.weight_scale).astype(q_chunk.dtype)
@@ -730,7 +730,7 @@ index 4f21424f..6f99a797 100644
              selected_indices = (
                  selected[..., None] * self.index_kpool
                  + mx.arange(self.index_kpool)[None, None, None]
-@@ -868,11 +920,15 @@ class Glm5NextSparseAttention(nn.Module):
+@@ -885,11 +937,15 @@ class Glm5NextSparseAttention(nn.Module):
                      mx.float16 if q_latent.dtype == mx.float32 else q_latent.dtype
                  )
                  q_latent = q_latent.astype(native_dtype)

@@ -1,3 +1,75 @@
+diff --git a/omlx/patches/glm53_kda_prework.py b/omlx/patches/glm53_kda_prework.py
+index 56aa9a7c..a2d7e550 100644
+--- a/omlx/patches/glm53_kda_prework.py
++++ b/omlx/patches/glm53_kda_prework.py
+@@ -36,6 +36,7 @@ _GLM53_KDA_PREFILL_ENABLED = (
+     os.environ.get("OMLX_GLM53_KDA_PREFILL_FUSED", "1") != "0"
+ )
+ _GLM53_KDA_PREFILL_MIN_ROWS = 64
++_P2_NOCONCAT = os.environ.get("OMLX_P2_KDA_NOCONCAT", "0") == "1"
+ 
+ _PREWORK_SOURCE = """
+     uint lane = thread_position_in_threadgroup.x;
+@@ -57,7 +58,7 @@ _PREWORK_SOURCE = """
+             uint input_row = row + tap;
+             const T xv = input_row < uint(NKEEP)
+                 ? conv_state[input_row * uint(C) + channel]
+-                : qkv[(input_row - uint(NKEEP)) * uint(C) + channel];
++                : qkv[(input_row - uint(NKEEP)) * uint(RS) + channel];
+             acc += float(xv) * float(conv_w[channel * 4 + tap]);
+         }
+         const T conv = T(acc);
+@@ -110,7 +111,7 @@ _PREWORK_SOURCE = """
+     }
+     if (row + uint(NKEEP) >= S_rt) {
+         uint state_row = row + uint(NKEEP) - S_rt;
+-        uint raw_base = row * uint(C) + channel_base + lane * 4;
++        uint raw_base = row * uint(RS) + channel_base + lane * 4;
+         uint state_base = state_row * uint(C) + channel_base + lane * 4;
+         for (uint i = 0; i < 4; ++i) {
+             conv_out[state_base + i] = qkv[raw_base + i];
+@@ -170,7 +171,7 @@ def _kernels():
+     return _KERNELS
+ 
+ 
+-def kda_prework_fused(mixed, conv_state, conv_w, q_scale, length, heads, dim):
++def kda_prework_fused(mixed, conv_state, conv_w, q_scale, length, heads, dim, row_stride=None):
+     """Fused conv+SiLU+L2 prework for one prefill chunk.
+ 
+     mixed [1,S,3*heads*dim] in the activation dtype, conv_state [1,3,C],
+@@ -185,6 +186,7 @@ def kda_prework_fused(mixed, conv_state, conv_w, q_scale, length, heads, dim):
+             ("H", heads),
+             ("D", dim),
+             ("C", c_dim),
++            ("RS", int(row_stride or c_dim)),
+             ("NKEEP", 3),
+         ],
+         grid=(32, length, 3 * heads),
+@@ -262,7 +264,15 @@ def glm53_kda_prefill(module, inputs, cache):
+     global _GLM53_KDA_ENGAGED_LOGGED
+     length = inputs.shape[1]
+     heads, dim = module.num_heads, module.head_dim
+-    if module.fuse_in:
++    row_stride = None
++    raw = module._fused_in_proj(inputs, raw=True) if (module.fuse_in and _P2_NOCONCAT) else None
++    if isinstance(raw, mx.array):
++        # Phase-2 (mac-studio-m5-ultra, OMLX_P2_KDA_NOCONCAT=1): the fused in-projection's rows are [q | k | v | f_a | g_a | b],
++        # so the prework kernel reads q/k/v in place with the row stride instead of a concatenated copy (3 * heads * dim
++        # bf16 per token, ~400 MB per layer per 8K chunk). Same values, bit-exact.
++        q_o, k_o, v_o, fa_o, ga_o, b_o = mx.split(raw, module._split_pts, axis=-1)
++        mixed, row_stride = raw, raw.shape[-1]
++    elif module.fuse_in:
+         q_o, k_o, v_o, fa_o, ga_o, b_o = module._fused_in_proj(inputs)
+         mixed = mx.concatenate([q_o, k_o, v_o], axis=-1)
+     else:
+@@ -285,6 +295,7 @@ def glm53_kda_prefill(module, inputs, cache):
+         length,
+         heads,
+         dim,
++        row_stride=row_stride,
+     )
+     cache[0] = next_conv
+ 
 diff --git a/omlx/patches/mlx_lm_mtp/batch_generator.py b/omlx/patches/mlx_lm_mtp/batch_generator.py
 index 71075fb9..05a49432 100644
 --- a/omlx/patches/mlx_lm_mtp/batch_generator.py
@@ -96,11 +168,117 @@ index 71075fb9..05a49432 100644
              was_warmup = bool(state.controller._warmup)
              keepalive = bool(getattr(state.mtp_cache, "fold_keepalive", False))
              if keepalive:
+diff --git a/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/gated_delta.py b/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/gated_delta.py
+index ce5416cd..f4cf1a0b 100644
+--- a/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/gated_delta.py
++++ b/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/gated_delta.py
+@@ -130,6 +130,84 @@ _gated_delta_kernel_vec_masked = _make_gated_delta_kernel(
+ )
+ 
+ 
++# Phase-2 (mac-studio-m5-ultra): prefill variant of the vectorized-gate kernel (OMLX_P2_KDA_REC_DKT=16). The kernel above keeps
++# Dk/32 = 4 state elements per thread and runs two 32-lane simd_sums per token, so on GLM-5.3 (64 heads x 128 x 128) the
++# shuffles cost more than the FMAs: 14.3 ms per 8K-token chunk and layer on M5 Ultra. Keeping DKT elements per thread and
++# reducing over Dk/DKT lanes (shuffle-xor) gives 6.2 ms at DKT=16. Same math and fp32 state; only the reduction order changes
++# (final state within 3e-8, outputs within one bf16 ulp). Used only for T >= OMLX_P2_KDA_REC_MIN_T tokens (prefill chunks);
++# decode and MTP verify keep their kernels.
++import os as _p2_os
++
++_P2_REC_DKT = int(_p2_os.environ.get("OMLX_P2_KDA_REC_DKT", "0"))
++_P2_REC_MIN_T = int(_p2_os.environ.get("OMLX_P2_KDA_REC_MIN_T", "16"))
++_P2_REC_SOURCE = """
++    constexpr int LANES = Dk / DKT;
++    constexpr int COLS = 32 / LANES;
++    auto n = thread_position_in_grid.z;
++    auto b_idx = n / Hv;
++    auto hv_idx = n % Hv;
++    auto hk_idx = hv_idx / (Hv / Hk);
++    uint lane = thread_index_in_simdgroup;
++    uint sub = lane % LANES;
++    uint dv_idx = thread_position_in_grid.y * COLS + lane / LANES;
++
++    auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk + sub * DKT;
++    auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk + sub * DKT;
++    auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
++    y += b_idx * T * Hv * Dv + hv_idx * Dv;
++    auto g_ = g + (b_idx * T * Hv + hv_idx) * Dk + sub * DKT;
++    auto beta_ = beta + b_idx * T * Hv;
++
++    auto i_state = state_in + (n * Dv + dv_idx) * Dk + sub * DKT;
++    auto o_state = state_out + (n * Dv + dv_idx) * Dk + sub * DKT;
++    float state[DKT];
++    for (int i = 0; i < DKT; ++i) state[i] = static_cast<float>(i_state[i]);
++
++    for (int t = 0; t < T; ++t) {
++      float kk[DKT];
++      float kv_mem = 0.0f;
++      for (int i = 0; i < DKT; ++i) {
++        kk[i] = static_cast<float>(k_[i]);
++        state[i] = state[i] * g_[i];
++        kv_mem += state[i] * kk[i];
++      }
++      for (uint off = LANES / 2; off >= 1; off >>= 1) kv_mem += simd_shuffle_xor(kv_mem, off);
++      float delta = (static_cast<float>(v_[dv_idx]) - kv_mem) * static_cast<float>(beta_[hv_idx]);
++      float out = 0.0f;
++      for (int i = 0; i < DKT; ++i) {
++        state[i] = state[i] + kk[i] * delta;
++        out += state[i] * static_cast<float>(q_[i]);
++      }
++      for (uint off = LANES / 2; off >= 1; off >>= 1) out += simd_shuffle_xor(out, off);
++      if (sub == 0) y[dv_idx] = static_cast<InT>(out);
++      q_ += Hk * Dk; k_ += Hk * Dk; v_ += Hv * Dv; y += Hv * Dv; g_ += Hv * Dk; beta_ += Hv;
++    }
++    for (int i = 0; i < DKT; ++i) o_state[i] = static_cast<StT>(state[i]);
++"""
++_p2_rec_kernel = None
++
++
++def _p2_rec(q, k, v, g, beta, state):
++    global _p2_rec_kernel
++    B, T, Hk, Dk = k.shape
++    Hv, Dv = v.shape[2:]
++    lanes = Dk // _P2_REC_DKT
++    cols = 32 // lanes
++    if _p2_rec_kernel is None:
++        _p2_rec_kernel = mx.fast.metal_kernel(
++            name="p2_gated_delta_vec_dkt", input_names=["q", "k", "v", "g", "beta", "state_in", "T"],
++            output_names=["y", "state_out"], source=_P2_REC_SOURCE,
++        )
++    return _p2_rec_kernel(
++        inputs=[q, k, v, g, beta, state, T],
++        template=[("InT", q.dtype), ("StT", state.dtype), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("DKT", _P2_REC_DKT)],
++        grid=(32, Dv // cols, B * Hv),
++        threadgroup=(32, 4, 1),
++        output_shapes=[(B, T, Hv, Dv), state.shape],
++        output_dtypes=[q.dtype, state.dtype],
++    )
++
++
+ @mx.compile
+ def _gated_delta_step_ops(
+     q: mx.array,
+@@ -190,6 +268,16 @@ def gated_delta_kernel(
+     Hv, Dv = v.shape[2:]
+     input_type = q.dtype
+     state_type = state.dtype
++    if (
++        g.ndim == 4
++        and mask is None
++        and _P2_REC_DKT
++        and T >= _P2_REC_MIN_T
++        and Dk % _P2_REC_DKT == 0
++        and 32 % (Dk // _P2_REC_DKT) == 0
++        and Dv % (4 * 32 // (Dk // _P2_REC_DKT)) == 0
++    ):
++        return _p2_rec(q, k, v, g, beta, state)
+     if g.ndim == 4:
+         kernel = _gated_delta_kernel_vec
+         inputs = [q, k, v, g, beta, state, T]
 diff --git a/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py b/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py
-index b2f9e834..4f21424f 100644
+index b2f9e834..bbf3acdf 100644
 --- a/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py
 +++ b/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py
-@@ -12,6 +12,24 @@ from ..base import (
+@@ -12,6 +12,38 @@ from ..base import (
  )
  from ..cache import ArraysCache, CacheList, KVCache
  from ..deepseek_v4.hyper_connection import HyperConnection, hc_expand
@@ -122,10 +300,24 @@ index b2f9e834..4f21424f 100644
 +
 +    HyperConnection._mix = _p2_hc_mix
 +    HyperConnection._p2_hc_gemv = True
++
++# Phase-2: HyperConnection pre-mix + its RMSNorm in two dispatches at decode/verify shapes (OMLX_P2_HC_FUSED=1,
++# omlx/patches/p2_hc_fused.py). Bit-exact against the path below at one row.
++from omlx.patches import p2_hc_fused as _p2_hc_fused
++
++
++def _p2_hc_pre(hc, norm, x):
++    """HyperConnection collapse followed by its RMSNorm: (normed, post, comb)."""
++    if _p2_hc_fused.eligible(hc, norm, x):
++        out = _p2_hc_fused.hc_pre(hc, norm, x)
++        if out is not None:
++            return out
++    xc, post, comb = hc(x)
++    return norm(xc), post, comb
  from mlx_lm.models.mla import MultiLinear
  from omlx.patches import glm53_kda_prework
  from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
-@@ -30,6 +48,42 @@ from .linear import fused_quantized_matmul, linear_forward
+@@ -30,6 +62,42 @@ from .linear import fused_quantized_matmul, linear_forward
  
  logger = logging.getLogger(__name__)
  _NATIVE_INDEXER_WARNED = False
@@ -168,8 +360,22 @@ index b2f9e834..4f21424f 100644
  
  
  def _cache_parts(cache):
-@@ -216,6 +270,74 @@ class Glm5NextLinearAttention(nn.Module):
+@@ -170,7 +238,7 @@ class Glm5NextLinearAttention(nn.Module):
+         self.fuse_in = True
+         self._fused_ready = False
+ 
+-    def _fused_in_proj(self, inputs):
++    def _fused_in_proj(self, inputs, raw=False):
+         # q,k,v,f_a,g_a,b all take `inputs`; fuse into one matmul via a lossless
+         # output-axis concat of the (quantized) weights, built once and cached.
+         if not self._fused_ready:
+@@ -214,8 +282,79 @@ class Glm5NextLinearAttention(nn.Module):
+             )
+         else:
              out = inputs @ self._fw.T
++        if raw:
++            # Phase-2: the unsplit [q | k | v | f_a | g_a | b] rows, so the prefill prework can read q/k/v in place.
++            return out
          return mx.split(out, self._split_pts, axis=-1)
  
 +    def _kda_pre(self, mixed, conv_state, fa_o):
@@ -243,7 +449,7 @@ index b2f9e834..4f21424f 100644
      def __call__(
          self,
          inputs: mx.array,
-@@ -225,6 +347,18 @@ class Glm5NextLinearAttention(nn.Module):
+@@ -225,6 +364,18 @@ class Glm5NextLinearAttention(nn.Module):
          B, S, _ = inputs.shape
          if glm53_kda_prework.glm53_kda_prefill_eligible(self, inputs, mask, cache):
              return glm53_kda_prework.glm53_kda_prefill(self, inputs, cache)
@@ -262,7 +468,7 @@ index b2f9e834..4f21424f 100644
          has_right_padding = cache is not None and cache.lengths is not None
          if has_right_padding:
              mask = mx.arange(S)[None] < cache.lengths[:, None]
-@@ -350,6 +484,11 @@ class Glm5NextIndexer(nn.Module):
+@@ -350,6 +501,11 @@ class Glm5NextIndexer(nn.Module):
  
      def _native_scores(self, q, pool_keys, weights):
          global _NATIVE_INDEXER_WARNED
@@ -274,7 +480,16 @@ index b2f9e834..4f21424f 100644
          if (
              q.shape[2] != self.n_heads
              or self.n_heads != 32
-@@ -958,7 +1097,8 @@ class Glm5NextDecoderLayer(nn.Module):
+@@ -951,14 +1107,15 @@ class Glm5NextDecoderLayer(nn.Module):
+         cache: Optional[Any] = None,
+     ) -> mx.array:
+         residual = x
+-        xc, post, comb = self.attn_hc(x)
+-        r = self.self_attn(self.input_layernorm(xc), mask, cache)
++        xn, post, comb = _p2_hc_pre(self.attn_hc, self.input_layernorm, x)
++        r = self.self_attn(xn, mask, cache)
+         x = hc_expand(r, residual, post, comb)
+         # Compile the FFN block only for single-stream decode (B=1, S=1) -- the shape it
          # was validated on and where its win lives. Compiling the 288-expert MoE at a
          # batched or prefill shape spikes memory (it can OOM alongside the resident
          # weights), so those shapes take the eager path.
@@ -284,7 +499,18 @@ index b2f9e834..4f21424f 100644
              if self._ffn_c is None:
                  self._ffn_c = mx.compile(self._ffn_block)
              return self._ffn_c(x)
-@@ -1012,12 +1152,11 @@ class Glm5NextModel(nn.Module):
+@@ -967,8 +1124,8 @@ class Glm5NextDecoderLayer(nn.Module):
+     def _ffn_block(self, x: mx.array) -> mx.array:
+         # Stateless FFN half (no cache) -> compiles cleanly at a fixed decode shape.
+         residual = x
+-        xc, post, comb = self.ffn_hc(x)
+-        m = self.mlp(self.post_attention_layernorm(xc))
++        xn, post, comb = _p2_hc_pre(self.ffn_hc, self.post_attention_layernorm, x)
++        m = self.mlp(xn)
+         return hc_expand(m, residual, post, comb)
+ 
+ 
+@@ -1012,12 +1169,11 @@ class Glm5NextModel(nn.Module):
          # Keep decode lazy; the MTP replacement loop must use the same policy.
          prefill = h.shape[1] >= 256
  
@@ -300,7 +526,7 @@ index b2f9e834..4f21424f 100644
          h = h.mean(axis=2)
          return self.norm(h)
 diff --git a/omlx/patches/mlx_vlm_mtp/glm5_next_vlm_runtime.py b/omlx/patches/mlx_vlm_mtp/glm5_next_vlm_runtime.py
-index 74d9eb1c..6f2534c1 100644
+index 74d9eb1c..a37258ab 100644
 --- a/omlx/patches/mlx_vlm_mtp/glm5_next_vlm_runtime.py
 +++ b/omlx/patches/mlx_vlm_mtp/glm5_next_vlm_runtime.py
 @@ -246,6 +246,23 @@ def _patch_linear_attention(g5_lang: Any) -> None:
@@ -327,7 +553,22 @@ index 74d9eb1c..6f2534c1 100644
          has_right_padding = cache is not None and cache.lengths is not None
          if has_right_padding:
              mask = mx.arange(S)[None] < cache.lengths[:, None]
-@@ -417,15 +434,14 @@ def _patch_model_call(g5_lang: Any) -> None:
+@@ -348,8 +365,12 @@ def _patch_decoder_layer(g5_lang: Any) -> None:
+         # Capture recurrent state only in KDA layers. Both attention families
+         # can compile the stateless FFN at the bounded MTP verify shapes.
+         residual = x
+-        xc, post, comb = self.attn_hc(x)
+-        normed = self.input_layernorm(xc)
++        hc_pre = getattr(g5_lang, "_p2_hc_pre", None)  # phase-2 two-dispatch HC pre-mix (OMLX_P2_HC_FUSED)
++        if hc_pre is not None:
++            normed, post, comb = hc_pre(self.attn_hc, self.input_layernorm, x)
++        else:
++            xc, post, comb = self.attn_hc(x)
++            normed = self.input_layernorm(xc)
+         if self.is_linear:
+             r = self.self_attn(normed, mask, cache, gdn_sink=gdn_sink)
+         else:
+@@ -417,15 +438,14 @@ def _patch_model_call(g5_lang: Any) -> None:
          # This replaces Glm5NextModel.__call__; preserve its prefill memory policy.
          prefill = h.shape[1] >= 256
  
@@ -345,6 +586,145 @@ index 74d9eb1c..6f2534c1 100644
  
          # Collapse the mHC streams first: everything downstream (the final
          # norm, the lm_head, and the nextn head) consumes the ordinary
+diff --git a/omlx/patches/p2_hc_fused.py b/omlx/patches/p2_hc_fused.py
+new file mode 100644
+index 00000000..c9ffb445
+--- /dev/null
++++ b/omlx/patches/p2_hc_fused.py
+@@ -0,0 +1,133 @@
++"""GLM-5.3 HyperConnection pre-mix in two dispatches at decode/verify shapes (phase 2, mac-studio-m5-ultra; OMLX_P2_HC_FUSED=1).
++
++The GLM-5.3 decoder runs HyperConnection.__call__ (fp32 cast, RMS norm, fp32 (rows, 16384) x (16384, 24) mix -- per token for
++verify blocks --, the sinkhorn/collapse kernel) and then the layer's RMSNorm: 5-8 dispatches, 90 times per step.
++
++mlx-vlm already ships a one-dispatch kernel for this (`_hc_normalized_norm_kernel`: normalize, mix, sinkhorn, collapse, output
++RMSNorm), but it only admits a bf16/fp16 mix weight, and GLM-5.3 stores it in fp32. It is also one threadgroup per row, so the
++1.5 MB fp32 weight read is serial. Here:
++
++1. `mix` kernel: one threadgroup per (output, row), 24 per row. Each computes the row's RMS factor with the one-dispatch kernel's
++   reduction tree and one mix output with its dot-product tree, so the mixes are bit-identical to that kernel's.
++2. mlx-vlm's `exact_hc_norm` (sinkhorn, collapse, output RMSNorm from the mixes).
++
++Result: bit-exact against the served path at one row, and every verify row computed the way a one-row decode computes it.
++25 us per call against 55 us in a dependent chain on M5 Ultra.
++"""
++import os
++
++import mlx.core as mx
++
++ENABLED = os.environ.get("OMLX_P2_HC_FUSED", "0") == "1"
++MAX_ROWS = int(os.environ.get("OMLX_P2_HC_FUSED_MAX_ROWS", "8"))
++
++_MIX_SOURCE = """
++uint out_idx = threadgroup_position_in_grid.x;
++uint row = threadgroup_position_in_grid.y;
++uint tid = thread_position_in_threadgroup.x;
++uint lane = thread_index_in_simdgroup;
++uint sg = simdgroup_index_in_threadgroup;
++constexpr int MIX = (2 + HC) * HC;
++constexpr int K_SIZE = HC * D;
++constexpr int TN = 4;
++constexpr int MIX_SIMDS = 8;
++constexpr int MIX_BLOCK = MIX_SIMDS * 32 * TN;
++constexpr float NORM_EPS = NORM_EPS_INT * 1e-9;
++const device T* x_row = x_in + row * K_SIZE;
++
++// RMS factor: same 1024-thread tree as mlx-vlm's short_block_hc_normalized_norm.
++threadgroup float norm_partials[32];
++threadgroup float inv_norm[1];
++float norm_sum = 0.0f;
++for (int k = int(tid) * TN; k < K_SIZE; k += 32 * 32 * TN) {
++  float4 value = float4(*(const device vec<T, 4>*)(x_row + k));
++  norm_sum += value.x * value.x;
++  norm_sum += value.y * value.y;
++  norm_sum += value.z * value.z;
++  norm_sum += value.w * value.w;
++}
++norm_sum = simd_sum(norm_sum);
++if (lane == 0) {
++  norm_partials[sg] = norm_sum;
++}
++threadgroup_barrier(mem_flags::mem_threadgroup);
++if (sg == 0) {
++  norm_sum = simd_sum(norm_partials[lane]);
++  if (lane == 0) {
++    inv_norm[0] = metal::precise::rsqrt(norm_sum / K_SIZE + NORM_EPS);
++  }
++}
++threadgroup_barrier(mem_flags::mem_threadgroup);
++
++// One mix output: same eight-SIMD dot-product tree as that kernel.
++threadgroup float mix_partials[MIX_SIMDS];
++if (sg < MIX_SIMDS) {
++  int bn = (int(sg) * 32 + int(lane)) * TN;
++  float result = 0.0f;
++  const device W* w_row = mix_weight + int(out_idx) * K_SIZE;
++  for (int k = 0; k < K_SIZE; k += MIX_BLOCK) {
++    float inv = inv_norm[0];
++    const device T* source_x = x_row + k + bn;
++    const device W* source_w = w_row + k + bn;
++    for (int tn = 0; tn < TN; ++tn) {
++      result += source_w[tn] * (float(source_x[tn]) * inv);
++    }
++  }
++  for (ushort offset = 16; offset >= 1; offset >>= 1) {
++    result += simd_shuffle_down(result, offset);
++  }
++  if (lane == 0) {
++    mix_partials[sg] = result;
++  }
++}
++threadgroup_barrier(mem_flags::mem_threadgroup);
++if (sg == 0 && lane == 0) {
++  float value = mix_partials[0];
++  for (int group = 1; group < MIX_SIMDS; ++group) {
++    value += mix_partials[group];
++  }
++  mixes[row * MIX + out_idx] = value;
++}
++"""
++_kernel = None
++
++
++def _mix_kernel():
++    global _kernel
++    if _kernel is None:
++        _kernel = mx.fast.metal_kernel(
++            name="p2_glm_hc_mix", input_names=["x_in", "mix_weight"], output_names=["mixes"], source=_MIX_SOURCE
++        )
++    return _kernel
++
++
++def eligible(hc, norm, x) -> bool:
++    return (
++        ENABLED
++        and not hc.training
++        and x.ndim == 4
++        and x.shape[0] * x.shape[1] <= MAX_ROWS
++        and x.shape[2:] == (4, 4096)
++        and x.dtype in (mx.bfloat16, mx.float16)
++        and hc.fn.shape == (24, 4 * 4096)
++        and norm.weight.dtype == x.dtype
++        and mx.default_device() == mx.gpu
++        and mx.metal.is_available()
++    )
++
++
++def hc_pre(hc, norm, x):
++    """(normed, post, comb) for HyperConnection `hc` followed by RMSNorm `norm`, or None if the shape is not handled."""
++    from mlx_vlm.models.fast_ops import exact_hc_norm
++
++    B, L = x.shape[:2]
++    x = mx.contiguous(x)
++    mixes = _mix_kernel()(
++        inputs=[x, hc.fn],
++        template=[("T", x.dtype), ("W", hc.fn.dtype), ("HC", 4), ("D", 4096), ("NORM_EPS_INT", round(hc.norm_eps / 1e-9))],
++        grid=(24 * 1024, B * L, 1),
++        threadgroup=(1024, 1, 1),
++        output_shapes=[(B, L, 24)],
++        output_dtypes=[mx.float32],
++    )[0]
++    return exact_hc_norm(hc, norm, x, mixes)
 diff --git a/omlx/patches/p2_kda_fused.py b/omlx/patches/p2_kda_fused.py
 new file mode 100644
 index 00000000..918923c9

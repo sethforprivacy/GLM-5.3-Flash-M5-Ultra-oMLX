@@ -1,5 +1,7 @@
 # oMLX `main` from source: how the recommended profile was reached
 
+Step 3 (2026-09-27 evening): three more patches in `patches/omlx-main-f0d8428a-glm.patch` (HC pre-mix, KDA prefill in-place q/k/v, KDA recurrence); see the README rows 11–13 and docs/VALIDATION.md.
+
 The recommended profile (README) is `main` @ f0d8428a + `patches/omlx-main-f0d8428a-glm.patch` + `patches/upstream-omlx-prs-3985-3986-3988.patch`, built by `scripts/install.sh`. This page keeps the step-by-step numbers.
 
 ## Step 1: main + recipe patch

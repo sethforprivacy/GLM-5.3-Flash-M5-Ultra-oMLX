@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-09-27 (evening)
+
+- **Recommended profile v2 (milestone 4):** three more patches on oMLX `main`, all env-gated and validated from scratch:
+  two-dispatch HyperConnection pre-mix (`OMLX_P2_HC_FUSED`, bit-exact at one row), KDA prefill reading q/k/v in place (`OMLX_P2_KDA_NOCONCAT`, bit-exact),
+  and a faster KDA prefill recurrence (`OMLX_P2_KDA_REC_DKT=16`).
+  Prefill 1,255 · 1,335 · 1,412 · 1,375 · 1,268 tok/s at 2K–256K (was 1,219 · 1,213 · 1,245 · 1,265 · 1,196), fresh decode 71.2 (was 68.9), agent edit turns 119–128 (were 114–121), KLD unchanged, all gates pass.
+- The DMG alternative is unchanged; these three need oMLX `main`.
+
 ## 2026-09-27 (later)
 
 - **New recommended profile (milestone 3):** oMLX `main` @ f0d8428a from source + recipe patch + upstream PRs #3985/#3986/#3988 (pinned patch), built by `scripts/install.sh` and served by `scripts/serve.sh`. Prefill 1,224–1,264 tok/s from 2K to 256K, decode 68.8 / 81.5, all gates pass, KLD identical.

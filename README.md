@@ -11,22 +11,22 @@ Companion recipe: [Qwen3.8-Flash-Next on the same machine](https://github.com/se
 
 - **Recommended: oMLX `main` built from source** (@ f0d8428a) with this recipe's patch and the upstream GLM-5.3 prefill PRs #3985/#3986/#3988, pinned as a patch.
   It needs git, Xcode and Python 3.11–3.13; the build takes ~10 minutes.
-- **Alternative: the oMLX 0.7.0rc1 app (DMG)** plus this recipe's patch. Nothing to build; prefill is ~20 % slower.
+- **Alternative: the oMLX 0.7.0rc1 app (DMG)** plus this recipe's patch. Nothing to build; prefill is ~20–30 % slower and decode ~4 % slower.
 
 ## Results (M5 Ultra 80c / 256 GB, macOS 27.0, `dfp-official/GLM-5.3-Flash-oQ4e-mtp` + grafted MTP head + official template)
 
 | | stock oMLX 0.7.0rc1 | alternative (0.7.0rc1 + patch) | **recommended (main + patch + PRs)** |
 |---|---|---|---|
-| decode, fresh prompt (greedy) | 42.0 tok/s | 68.4 | **68.8 tok/s** |
-| decode, 2K-token code prompt | 37.8 | 61–81 | **81.5** |
-| agent edit/copy turns (return a file with a change) | 40–43 | 117–123 | **117–123** |
-| prefill 2K · 32K · 128K · 256K | 798 · 796 · 778 · 736 | 1,005 · 1,039 · 993 · 901 | **1,224 · 1,242 · 1,264 · 1,200** |
-| warm follow-up turn at 32K | | 0.88 s | **0.46 s** |
-| aggregate at 2 · 8 streams | 47 · 106 | 75 · 109 | 73 · 108 |
-| KLD vs BF16: teacher-forced · decode-path | 0.0347 · 0.0433 | 0.0347 · 0.0433 | 0.0347 · 0.0433 |
+| decode, fresh prompt (greedy) | 42.0 tok/s | 68.4 | **71.2 tok/s** |
+| decode, 2K-token code prompt | 37.8 | 61–81 | **71–91** |
+| agent edit/copy turns (return a file with a change) | 40–43 | 117–123 | **119–128** |
+| prefill 2K · 32K · 128K · 256K | 798 · 796 · 778 · 736 | 1,005 · 1,039 · 993 · 901 | **1,255 · 1,412 · 1,375 · 1,268** |
+| warm follow-up turn at 32K | | 0.88 s | **0.51 s** |
+| aggregate at 2 · 8 streams | 47 · 106 | 75 · 109 | 76 · 109 |
+| KLD vs BF16: teacher-forced · decode-path | 0.0347 · 0.0433 | 0.0347 · 0.0433 | 0.0345 · 0.0427 |
 | reasoning / tool / long-context / vision gates | 12/12 · pass · pass · **fail** | 12/12 · all pass | **12/12 · all pass** |
 
-Against stock, the recommended profile gives **decode +64 % (+116 % on code) and prefill +53–63 %**, with the same quality and vision fixed.
+Against stock, the recommended profile gives **decode +70 % (+89–141 % on code), agent edit turns ~3×, and prefill +57 % at 2K to +77 % at 32K–128K**, with the same quality and vision fixed.
 
 ## What changes, and why
 
@@ -42,6 +42,9 @@ Against stock, the recommended profile gives **decode +64 % (+116 % on code) and
 | 8 | **Official chat template** (zai-org, pinned) instead of dfp's text-only one, which breaks every image request. | **vision works** |
 | 9 | **Batched decode:** HyperConnection mix as a batched matvec (MLX's GEMM is 5.5× slower at N=24 for 2+ rows), fused KDA and FFN compile for B>1. | c=2 +16 %, c=8 +6 % |
 | 10 | *(recommended profile)* **Upstream PRs #3985/#3986/#3988** by jonathan308 (open at the time of writing): tensor-unit DSA indexer and sparse-MLA prefill kernels, plus 8K prefill chunks on NAX hosts. | prefill +11–21 %, no taper with context |
+| 11 | *(recommended profile)* **HyperConnection pre-mix in two dispatches.** The decoder ran 5–8 small kernels per HC, 90× per step. mlx-vlm's one-dispatch kernel for this rejects GLM's fp32 mix weight; we feed it fp32 and split the mix across 24 threadgroups. Bit-exact at one row. | decode step −5 %, verify step −6 %; agent turns +5–13 % |
+| 12 | *(recommended profile)* **KDA prefill reads q/k/v in place.** The prefill copied q/k/v out of the fused in-projection (~400 MB per layer per 8K chunk) only to give a kernel contiguous rows; it now reads them with a row stride. Bit-exact. | prefill +7–14 % |
+| 13 | *(recommended profile)* **Faster KDA prefill recurrence:** 16 state elements per thread and 8-lane reductions instead of 4 and 32, so shuffles stop dominating. | recurrence 2.3× faster; prefill +4–6 % more |
 
 ## Setup (recommended profile)
 
