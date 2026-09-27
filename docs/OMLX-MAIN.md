@@ -8,10 +8,12 @@ oMLX `main` @ [`f0d8428a`](https://github.com/jundot/omlx/commit/f0d8428a) (17 c
 |---|---|---|---|---|
 | GLM decode fresh · code 2K | ~67 · ~60 | 68.6 · 60.8 | 67.1 · 55.2 | **69.4 · 68.8** |
 | GLM prefill 8K · 32K | 800 · 796 | 1,050 · 1,037 | 881 · 911 | **1,121 · 1,086** |
-| GLM KLD teacher-forced · decode-path | 0.0347 · 0.0433 | 0.0347 · 0.0433 | | **0.0347 · 0.0433** (identical) |
-| gates (reasoning · qualify) | 12/12 · pass | 12/12 · pass* | | **12/12 · pass*** |
+| GLM KLD teacher-forced · decode-path | 0.0347 · 0.0433 | 0.0347† · 0.0433 | | **0.0347 · 0.0433** (both measured, identical) |
+| gates (reasoning · qualify) | 12/12 · pass* | 12/12 · pass* | | **12/12 · pass*** |
 | Qwen oQ6e decode fresh · code 2K | 146–150 · 112–126 | 146.9 · 122.7 | 142.6 · 118.9 | 140.8 · 117.7 |
 | Qwen prefill 8K · 32K | ~3,300 · 3,381–3,567 | 3,300 · 3,579 | 3,286 · 3,785 | 3,293 · **3,879** |
+
+† Not re-measured: every rc1 change is decode/verify-only (≤ 8 rows) or scheduling-only, so teacher-forced windows run the stock code path.
 
 \* GLM qualify fails only vision-red, the checkpoint's own processor bug on stock too. Qwen passes everything, including vision.
 
