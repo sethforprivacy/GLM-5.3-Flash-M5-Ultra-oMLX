@@ -48,6 +48,18 @@ KLD against BF16 teacher logits (`brandonmusic/GLM-5.3-Flash-BF16-Teacher-Logits
 - **Why:** #3983 computes the HyperConnection mix in exact fp32. Stock runs that mix as an fp32 matmul, which MLX executes in TF32 on M5, and TF32's rounding happens to sit closer to this BF16 teacher on the decode-path panel.
 - **Other checks:** reasoning (12/12) and every qualify gate pass either way.
 
+## Choosing an engine for GLM on this machine
+
+[TensorFold](https://github.com/ashhart/TensorFold) 0.3.6.1 runs GLM-5.3-Flash on Macs and loads this recipe's exact weights (the grafted oQ4e checkpoint). Same box, 2026-09-28:
+
+| | fresh decode · 2K code | prefill 32K · 128K · 256K | edit / JSON / fix turns | 1 · 8 streams | streams identical to solo | vision |
+|---|---|---|---|---|---|---|
+| **oMLX + this recipe** | 79–81 · 80 | **2,233 · 2,183 · 2,024** | **145 · 145 · 133** | 83 · 114 | 1/8 | **yes** |
+| TensorFold 0.3.6.1 | 77–78 · **103–153** | 1,027 · 856 · 630 | 123 · 123 · 100 | 84 · **121** | **8/8** | no |
+
+- This recipe prefills 2.2–3.2× faster at 32K–256K and is faster on agent edit turns.
+- TensorFold is faster on long code decodes and on 2–8 streams, and its streams are exact under concurrency. It has no image input.
+
 ## What changes, and why
 
 | # | Change | Effect |
