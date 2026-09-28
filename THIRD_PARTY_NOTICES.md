@@ -18,13 +18,10 @@ Every change is marked in-code with a "Phase-2" / "p2" comment and sits behind a
 - `omlx/patches/mlx_vlm_mtp/glm5_next_vlm_runtime.py`: the same hooks in the MTP runtime's copies of those paths.
 - `omlx/patches/p2_kda_fused.py` (new): single-dispatch KDA Metal kernel.
 
-## Upstream oMLX pull requests (Apache-2.0)
+## Upstream oMLX pull request (Apache-2.0)
 
-`patches/upstream-omlx-glm53-stack.patch` is the combined diff of sixteen open oMLX pull requests by jonathan308, merged onto f0d8428a in this order:
-#3970 fba85855, #3974 f4ce2735, #3971 b42d94b2, #3983 7d925bd9, #3984 52c78b1f, #3985 eb59da9b, #3986 8ac5aa9a, #3987 5fbc4927, #3988 d73f689d,
-#3993 a68cab68, #3995 97e473ef, #3996 03e9b678, #4022 d6dbc997, #4025 9eeaf899, #4029 498685ba, #4026 e886b410 (contains #3989 and #4019).
-They are contributions to oMLX under its Apache-2.0 license and are redistributed unchanged, except for the merge of #4026 with #3971:
-both edit the per-layer loop of `Glm5NextModel.__call__` and of the MTP runtime's copy, and the resolution keeps both (the prefill layer pipeline and the decode early-eval / deferred-HC scheduling).
+`patches/upstream-omlx-glm53-4026.patch` is jonathan308's open pull request [#4026](https://github.com/jundot/omlx/pull/4026) (head 8e150d98, which contains #3989 and #4019), merged onto oMLX `main` @ a98d8c8c.
+It is a contribution to oMLX under its Apache-2.0 license and is redistributed unchanged, except for the merge with #3971, which `main` already has. Both edit the per-layer loop of `Glm5NextModel.__call__` and of the MTP runtime's copy. The resolution keeps both: the prefill layer pipeline, and decode's early eval / deferred HC.
 
 ## Ideas credited, no code copied
 

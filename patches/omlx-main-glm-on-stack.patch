@@ -1,8 +1,8 @@
 diff --git a/omlx/patches/mlx_lm_mtp/batch_generator.py b/omlx/patches/mlx_lm_mtp/batch_generator.py
-index 71075fb9..05a49432 100644
+index f8e9ae1d..f2bad29a 100644
 --- a/omlx/patches/mlx_lm_mtp/batch_generator.py
 +++ b/omlx/patches/mlx_lm_mtp/batch_generator.py
-@@ -23,6 +23,8 @@ from collections import deque
+@@ -24,6 +24,8 @@ from collections import deque
  from dataclasses import dataclass, field
  from statistics import median
  from types import SimpleNamespace
@@ -11,7 +11,7 @@ index 71075fb9..05a49432 100644
  from typing import Any, Deque, Dict, List, Optional, Tuple
  
  from omlx.prefill_progress import get_prefill_tracker
-@@ -2901,6 +2903,8 @@ def _chain_next_drafts(
+@@ -2932,6 +2934,8 @@ def _chain_next_drafts(
      hidden_rows: Any,
      committed: Any,
      prev_buf: Optional[Any],
@@ -20,7 +20,7 @@ index 71075fb9..05a49432 100644
  ) -> None:
      """Rebuild committed MTP-head history and draft the next chain.
  
-@@ -2936,7 +2940,7 @@ def _chain_next_drafts(
+@@ -2967,7 +2971,7 @@ def _chain_next_drafts(
      procs = _proc_list(gen_batch)
  
      depth = state.controller.cur if state.controller is not None else state.depth
@@ -29,7 +29,7 @@ index 71075fb9..05a49432 100644
          # Depth-0 with a stateless head (no cache to keep warm, e.g. the
          # gemma4 assistant): skip the fold entirely — on fast backbones its
          # head forward + trunk norm is a measurable per-step tax (~15% of a
-@@ -2977,6 +2981,11 @@ def _chain_next_drafts(
+@@ -3008,6 +3012,11 @@ def _chain_next_drafts(
          )
      state.hist_offset += int(n)
  
@@ -41,7 +41,7 @@ index 71075fb9..05a49432 100644
      draft_toks: List[Any] = []
      draft_lps: List[Any] = []
      draft_accept_lps: List[Any] = []
-@@ -3622,6 +3631,8 @@ def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
+@@ -3653,6 +3662,8 @@ def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
  
  
  def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
@@ -50,7 +50,7 @@ index 71075fb9..05a49432 100644
      """Emit a one-line summary of MTP draft/verify activity for a finished sequence.
  
      Format chosen to match PR 990's headline metrics, plus component timings
-@@ -4108,8 +4119,8 @@ def _run_verify_cycle_chain(
+@@ -4139,8 +4150,8 @@ def _run_verify_cycle_chain(
  
      # --- stats ---
      state.stats.cycles += 1
@@ -61,7 +61,7 @@ index 71075fb9..05a49432 100644
          state.stats.depth_drafted.extend([0] * pad)
          state.stats.depth_accepted.extend([0] * pad)
      for j in range(k):
-@@ -4125,6 +4136,8 @@ def _run_verify_cycle_chain(
+@@ -4156,6 +4167,8 @@ def _run_verify_cycle_chain(
  
      accept_ms = (time.perf_counter() - cycle_t0) * 1000
  
@@ -70,7 +70,7 @@ index 71075fb9..05a49432 100644
      def draft_next():
          # --- MTP-head history + next draft chain (async-dispatched) ---
          t0 = time.perf_counter()
-@@ -4150,7 +4163,15 @@ def _run_verify_cycle_chain(
+@@ -4181,7 +4194,15 @@ def _run_verify_cycle_chain(
              else:
                  draft_jobs.append(job)
          elif draft_jobs is None:
@@ -87,7 +87,7 @@ index 71075fb9..05a49432 100644
          else:
              draft_jobs.append((gen_batch, state, hidden_rows, committed, prev_buf))
          state.next_main = next_main
-@@ -4194,7 +4215,7 @@ def _run_verify_cycle_chain(
+@@ -4225,7 +4246,7 @@ def _run_verify_cycle_chain(
          if materialize_boundary_emit:
              _materialize_mtp_boundary_emit(gen_batch, state)
              state.boundary_emit_pending = False
@@ -97,10 +97,10 @@ index 71075fb9..05a49432 100644
              keepalive = bool(getattr(state.mtp_cache, "fold_keepalive", False))
              if keepalive:
 diff --git a/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py b/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py
-index e8833dfb..89c472ce 100644
+index f0aa61c3..3911468c 100644
 --- a/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py
 +++ b/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py
-@@ -302,6 +302,9 @@ def glm5_next_cast_predicate(key: str) -> bool:
+@@ -296,6 +296,9 @@ def glm5_next_cast_predicate(key: str) -> bool:
      )
  
  
@@ -110,7 +110,7 @@ index e8833dfb..89c472ce 100644
  class HyperConnection(_HyperConnection):
      """mlx-vlm's hyper-connection with fused, batch-invariant prefill kernels.
  
-@@ -316,6 +319,16 @@ class HyperConnection(_HyperConnection):
+@@ -310,6 +313,16 @@ class HyperConnection(_HyperConnection):
                  return fused
          return super().__call__(x)
  

@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-09-28: recommended profile rebased onto oMLX `main`
+
+- oMLX merged jonathan308's GLM-5.3 prefill and MoE PRs (plus maintainer follow-ups) into `main`. The recipe now builds `main` @ a98d8c8c + the still-open #4026 (`patches/upstream-omlx-glm53-4026.patch`) + the same recipe patch. The 16-PR pinned stack patch is gone.
+- Validated from scratch: prefill 1,990 · 2,261 · 2,233 · 2,183 · 2,024 tok/s at 2K–256K, decode 79–81, agent edit turns 133–145, ladder 83 · 79 · 102 · 114, 12/12 and all gates, KLD identical to v3.
+
 ## 2026-09-27 (night): recommended profile v3
 
 - **The recommended build is now oMLX `main` + jonathan308's open GLM-5.3 PR stack (16 PRs, pinned in `patches/upstream-omlx-glm53-stack.patch`) + a small recipe patch**

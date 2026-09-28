@@ -103,3 +103,16 @@ KLD with the new decode and prefill paths: teacher-forced 0.0345 / top-1 0.9419,
    - **Bisect:** decode-path KLD over the merge sequence gives 0.0433 through #3971, and 0.0482 from #3983 on. Turning #3983 off (`OMLX_GLM_HC_PREFILL=0`) restores teacher-forced 0.0347 exactly.
    - **TF32 off:** with MLX TF32 off, stock `main` and v3 are identical (decode-path 0.0482, teacher-forced 0.0345), so #3983's exact-fp32 HC mix matches exact-fp32 stock.
    - **Toggles:** decode fusion, gate/up fusion, the P×V split and the NAX indexer each leave KLD bit-identical.
+
+## 2026-09-28: recommended profile rebased onto oMLX `main` @ a98d8c8c (+ #4026 + recipe patch), from scratch
+
+- **Build:** `scripts/install.sh` into a fresh tree. It is identical to the development branch (`glm-v4`), and every native kernel loads.
+- **Tests:** GLM / DSA / MoE suites in that tree, **1,023 passed, 2 skipped**. The PRs' test files were merged into existing modules upstream.
+- **Cell:**
+  - prefill 1,990 · 2,261 · 2,233 · 2,183 · 2,024 tok/s at 2K–256K; decode fresh 81.2 / 78.6, code 2K 79.7;
+  - warm 8K · 32K 0.42 · 0.55 s; ladder 83.0 · 79.0 · 102.1 · 114.4;
+  - reasoning 12/12, all qualify gates pass (vision, tool, 127K).
+- **Agent mix:**
+  - T=0: edit 145.1 · JSON 145.1 · fix 133.3 · diff 72.8 · prose 62.4 · new code 81.3;
+  - T=0.6: edit 143.0 · JSON 143.0 · fix 122.8.
+- **KLD:** teacher-forced 0.0361 / top-1 0.9405, decode-path 0.0482 (1-token) and 0.0476 (3-token), identical to v3 (see README, Quality).
