@@ -3,15 +3,14 @@
 A recipe for serving **GLM-5.3-Flash** on one Mac Studio M5 Ultra (80-core GPU, 256 GB) with [oMLX](https://github.com/jundot/omlx):
 an MTP-head graft and the official chat template for the checkpoint, plus a pinned build of oMLX `main`.
 
-- **The build:** oMLX `main`, which since 2026-09-28 includes jonathan308's GLM-5.3 prefill PRs (most of the speed). On top go his open decode PR #4026 and a small patch of ours.
+- **The build:** oMLX `main`, which includes jonathan308's GLM-5.3 prefill PRs (since 2026-09-28) and his fused decode/verify PRs (since 2026-09-29): most of the speed. On top goes a small patch of ours.
 - **Quality:** unchanged. KLD against BF16 is identical to stock oMLX computed in exact fp32 ([Quality](#quality)), and every gate passes, **vision included**.
 
 Companion recipe: [Qwen3.8-Flash-Next on the same machine](https://github.com/sethforprivacy/Qwen3.8-Flash-Next-M5-Ultra-oMLX).
 
 ## Two profiles
 
-- **Recommended: oMLX `main` built from source** (@ a98d8c8c), in three layers:
-  - jonathan308's open decode/verify PR #4026, pinned as one patch;
+- **Recommended: oMLX `main` built from source** (@ 65515c3c), in two layers:
   - this recipe's patch: prompt-lookup MTP drafts and the batched HC mix for 2+ streams;
   - the MTP graft and the official template.
 
@@ -67,7 +66,7 @@ KLD against BF16 teacher logits (`brandonmusic/GLM-5.3-Flash-BF16-Teacher-Logits
 | 1 | **Graft the missing MTP head.** `dfp-official/GLM-5.3-Flash-oQ4e-mtp` @728cc0d declares one nextn layer but ships none, so oMLX silently decodes without MTP. `scripts/graft_mtp.py` adds layer 45 from `Vontra/GLM-5.3-Flash-MLX-4bit-MTP` by symlinking the backbone, which stays byte-identical. | +56 % decode |
 | 2 | **Fixed MTP depth 2.** Each verify row pulls a fresh set of 8-of-288 experts, so depth ≥3 loses at T=0.6. | +8 % on code vs adaptive |
 | 3 | **Official chat template** (zai-org, pinned) instead of dfp's text-only one, which breaks every image request. | **vision works** |
-| 4 | *(recommended)* **jonathan308's GLM-5.3 performance PRs** ([CREDITS.md](CREDITS.md)). Prefill gets pipelined layers, fused HC prefill kernels, a per-core KDA recurrence, tensor-unit indexer and sparse MLA, 8K chunks, and fused MoE gate/up with NAX gather tiles; these are in oMLX `main` since 2026-09-28. Decode and MTP verify get exact fused kernels from the still-open #4026. | prefill 2.4–2.9× stock; fresh decode 69 → 82 tok/s |
+| 4 | *(recommended)* **jonathan308's GLM-5.3 performance PRs** ([CREDITS.md](CREDITS.md)). Prefill gets pipelined layers, fused HC prefill kernels, a per-core KDA recurrence, tensor-unit indexer and sparse MLA, 8K chunks, and fused MoE gate/up with NAX gather tiles; these are in oMLX `main` since 2026-09-28. Decode and MTP verify get exact fused kernels (#3989, #4019, #4026), in `main` since 2026-09-29. | prefill 2.4–2.9× stock; fresh decode 69 → 82 tok/s |
 | 5 | **Prompt-lookup drafts in the MTP cycle** (`OMLX_P2_LOOKUP`). When the text being written already appears in the prompt or output, the next cycle verifies that continuation (up to 7 drafts) with exact acceptance, sampling included. The idea comes from mlx-serve #523/#533. | edit/JSON/fix turns +40–53 %, flat elsewhere |
 | 6 | **Batched HC mix for 2+ streams** (`OMLX_P2_HC_GEMV`). MLX's fp32 GEMM is 5.5× slower than a matvec at N=24 for 2+ rows. | c=2 +14 %, c=4 +11 % |
 | 7 | *(DMG profile only)* The rc1-era decode and prefill patches: indexer routing, compiled glue, a fused KDA kernel, and a prefill pool policy ([docs/ENVS.md](docs/ENVS.md)). On `main` the upstream stack supersedes them. | |
@@ -80,7 +79,7 @@ Plan for about 200 GB of disk (the ~182 GB backbone plus 8.6 GB of graft source)
    ```bash
    sudo sysctl iogpu.wired_limit_mb=245760
    ```
-2. **Build patched oMLX `main`.** This clones oMLX into `~/omlx-glm-src`, applies #4026 and this recipe's patch, builds the native kernels, and checks that they all load.
+2. **Build patched oMLX `main`.** This clones oMLX into `~/omlx-glm-src`, checks out the pinned `main` commit, applies this recipe's patch, builds the native kernels, and checks that they all load.
    ```bash
    scripts/install.sh
    ```
@@ -105,7 +104,10 @@ Plan for about 200 GB of disk (the ~182 GB backbone plus 8.6 GB of graft source)
 - **Stop token:** the model sometimes emits `<|assistant|>` plus extra text after an answer, with or without this recipe (checkpoint template).
 - **Concurrency:** prompt lookup and the fused decode kernels are single-stream. 2+ streams run the batched path, 79–115 tok/s aggregate.
 - **Greedy text** is not byte-identical to plain decoding, with or without this recipe, because multi-row MTP verify rounds differently.
-- **The recommended profile builds on oMLX `main` plus one unmerged PR** (#4026, pinned in `patches/upstream-omlx-glm53-4026.patch` at the head listed in [CREDITS.md](CREDITS.md)). As it merges, the recipe will move to an oMLX release that contains it.
+- **The recommended profile builds on a pinned oMLX `main` commit** (65515c3c), not a release. All the upstream GLM-5.3 PRs it uses are merged; the recipe will move to the first oMLX release that contains them.
+- **Long contexts:** one 512K-token request works (prefill 1,684 tok/s at 512K, 33 tok/s decode at that depth, 470K-token recall passes, peak RAM 227 GB).
+  Several long requests at once can briefly spike memory when they join one batch: 4 × 125K concurrent reached 260 GB of system RAM (above the 240 GiB Metal limit) for a few seconds, while 2 × 250K was fine.
+  If you serve long contexts to several clients, cap the context per request (`max_context_window` in the per-model settings) and keep the combined live context well under ~400K tokens.
 
 ## Credits and license
 

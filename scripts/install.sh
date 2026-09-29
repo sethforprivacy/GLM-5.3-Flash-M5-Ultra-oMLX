@@ -1,6 +1,6 @@
 #!/bin/zsh
-# RECOMMENDED profile: oMLX main @ a98d8c8c built from source (it now contains the upstream GLM-5.3 / Qwen4 performance PRs),
-# plus upstream PR #4026 (jonathan308, GLM-5.3 fused decode/verify) and this recipe's patch on top. Native kernels included.
+# RECOMMENDED profile: oMLX main @ 65515c3c built from source (it contains the upstream GLM-5.3 prefill and decode stacks,
+# including jonathan308's fused decode/verify #3989/#4019/#4026), plus this recipe's patch on top. Native kernels included.
 set -euo pipefail
 here=${0:A:h}
 dest=${1:-$HOME/omlx-glm-src}
@@ -11,9 +11,7 @@ xcrun -f metal >/dev/null 2>&1 || { echo "need Xcode's Metal toolchain (xcrun me
 [[ -e $dest ]] && { echo "$dest exists; remove it first" >&2; exit 1; }
 git clone -q https://github.com/jundot/omlx.git $dest
 cd $dest
-git checkout -q a98d8c8c
-git apply $here/../patches/upstream-omlx-glm53-4026.patch
-git add -A && git -c user.name=recipe -c user.email=recipe@localhost commit -q -m "upstream PR #4026 (jonathan308, GLM-5.3 fused decode/verify)"
+git checkout -q 65515c3c
 git apply $here/../patches/omlx-main-glm-on-stack.patch
 git add -A && git -c user.name=recipe -c user.email=recipe@localhost commit -q -m "mac-studio-m5-ultra recipe patch"
 $py -m venv .venv

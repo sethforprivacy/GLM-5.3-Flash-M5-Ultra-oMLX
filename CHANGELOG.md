@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-09-29: recommended profile on oMLX `main` @ 65515c3c (no pinned PRs)
+
+- oMLX merged #4026 (jonathan308's fused GLM-5.3 decode/verify, with #3989/#4019) and a maintainer follow-up, plus #4031 (MTP late-join hand-off: a finished batch row no longer triggers a full re-prefill of the survivor).
+  The recipe now builds `main` @ 65515c3c + the recipe patch; `patches/upstream-omlx-glm53-4026.patch` is gone.
+- The recipe patch gains `import os` in `glm5_next/language.py` (upstream's follow-up dropped the import the batched-HC switch relied on).
+- Validated from scratch: 926 GLM tests pass; performance at parity with the 09-28 build in an ABBA repeat (fresh decode 80.4 vs 80.8, prefill 32K 2,239 vs 2,235, 128K 2,179 vs 2,177), agent edit turns 141–143, 12/12 and all gates including vision, KLD identical (0.0361 / 0.0482).
+- New: single-request 512K context qualified; concurrent long contexts documented as a known issue (README).
+
 ## 2026-09-28: recommended profile rebased onto oMLX `main`
 
 - oMLX merged jonathan308's GLM-5.3 prefill and MoE PRs (plus maintainer follow-ups) into `main`. The recipe now builds `main` @ a98d8c8c + the still-open #4026 (`patches/upstream-omlx-glm53-4026.patch`) + the same recipe patch. The 16-PR pinned stack patch is gone.

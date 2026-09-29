@@ -104,6 +104,19 @@ KLD with the new decode and prefill paths: teacher-forced 0.0345 / top-1 0.9419,
    - **TF32 off:** with MLX TF32 off, stock `main` and v3 are identical (decode-path 0.0482, teacher-forced 0.0345), so #3983's exact-fp32 HC mix matches exact-fp32 stock.
    - **Toggles:** decode fusion, gate/up fusion, the P×V split and the NAX indexer each leave KLD bit-identical.
 
+## 2026-09-29: recommended profile on oMLX `main` @ 65515c3c (+ recipe patch), from scratch
+
+- **Build:** `scripts/install.sh` into a fresh tree, identical to the development branch (`glm-v5`); every native kernel loads.
+- **Tests:** every `tests/` file matching glm|kda|layer_pipeline|dsa|sparse_mla|hc_prefill|moe_gate|gather_qmm: **926 passed, 1 skipped** (upstream merged and reorganised the GLM test files).
+- **Cell (back-to-back with the 09-28 build, same night):**
+  - prefill 1,975 · 2,256 · 2,142 · 2,147 · 2,020 tok/s at 2K–256K (09-28 build: 1,984 · 2,113 · 2,233 · 2,180 · 2,023); ladder 82.7 · 77.4 · 100.8 · 111.3 (82.9 · 78.4 · 98.1 · 113.5);
+  - reasoning 12/12, all qualify gates pass (vision, tool, 127K).
+- **ABBA repeat** (decode + 32K/128K prefill, A = 09-28 build, B = this build): fresh decode A 80.82 / 80.78, B 80.48 / 80.39; prefill 32K A 2,261 / 2,208, B 2,216 / 2,261; 128K A 2,169 / 2,184, B 2,180 / 2,177. Parity.
+- **Agent mix, T=0:** edit 141.3 · JSON 143.1 · fix 132.9 · diff 72.3 · prose 62.2 · new code 81.0 (09-28 build same night: 145.0 · 145.0 · 133.3 · 72.8 · 62.4 · 81.3).
+- **KLD:** teacher-forced 0.0361 / top-1 0.9405, decode-path 0.0482: identical.
+- **Long context (single server, per-model `max_context_window` 524288):** prefill 393K 1,833 tok/s and 512K 1,684 tok/s (decode at depth 34 / 33); recall at 250K and 470K pass; 2 × 250K concurrent pass (peak RAM 227 GB).
+  4 × 125K concurrent: two streams answered correctly, then system RAM spiked 218 → 260 GB within ~5 s as three long rows joined one MTP batch (oMLX's enforcer saw 229 GB and deferred while pooled Metal buffers drained); our watchdog stopped the server. Not qualified.
+
 ## 2026-09-28: recommended profile rebased onto oMLX `main` @ a98d8c8c (+ #4026 + recipe patch), from scratch
 
 - **Build:** `scripts/install.sh` into a fresh tree. It is identical to the development branch (`glm-v4`), and every native kernel loads.
