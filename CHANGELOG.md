@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-09-29 (afternoon): fix `IndexError: list index out of range` under concurrent requests
+
+- **Symptom:** with two or more requests decoding at once (e.g. an agent client running parallel subagents), clients got `list index out of range` and aborted streams.
+  The server log shows `batch_policy.observe_mtp` → `self.acceptance[position]` raising, and the engine loop failing every in-flight stream.
+- **Cause:** the recipe's prompt-lookup drafts (`OMLX_P2_LOOKUP=1`) can verify more tokens than the MTP depth (fixed depth 2 in `configs/model_settings.glm.json`; lookup drafts of up to 7 tokens).
+  The single-request chain path already padded its stats for that. The **batched** verify cycle passed the longer depth to `observe_mtp`, whose per-position acceptance list has only `max_depth` entries.
+  Upstream oMLX is not affected: without the recipe's lookup drafts, a batched row never drafts past the policy's depth.
+- **Fix** (in `patches/omlx-main-glm-on-stack.patch`): `observe_mtp` updates acceptance only for `range(min(depth, len(self.acceptance)))`.
+  Lookup positions never governed the MTP depth, and cost samples were already limited to stable MTP depths.
+- **Verified:** a depth-5 observe on a depth-2 policy raises before the fix and passes after.
+  Served, 4 and 8 concurrent copy-edit requests (1,400 tokens each, lookup drafts active) all finish; 12/12 multi-turn tool episodes at 4 in parallel; no IndexError in the server log.
+- Existing installs: re-apply the patch, or edit `omlx/patches/mlx_lm_mtp/batch_policy.py` by hand. It is pure Python, so no rebuild is needed; restart the server.
+
 ## 2026-09-29: recommended profile on oMLX `main` @ 65515c3c (no pinned PRs)
 
 - oMLX merged #4026 (jonathan308's fused GLM-5.3 decode/verify, with #3989/#4019) and a maintainer follow-up, plus #4031 (MTP late-join hand-off: a finished batch row no longer triggers a full re-prefill of the survivor).

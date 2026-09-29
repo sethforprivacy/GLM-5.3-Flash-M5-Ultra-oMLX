@@ -96,6 +96,23 @@ index c7fab16e..9c134c1d 100644
              was_warmup = bool(state.controller._warmup)
              keepalive = bool(getattr(state.mtp_cache, "fold_keepalive", False))
              if keepalive:
+diff --git a/omlx/patches/mlx_lm_mtp/batch_policy.py b/omlx/patches/mlx_lm_mtp/batch_policy.py
+index e6b24c1a..94d8aa47 100644
+--- a/omlx/patches/mlx_lm_mtp/batch_policy.py
++++ b/omlx/patches/mlx_lm_mtp/batch_policy.py
+@@ -84,7 +84,11 @@ class BatchPolicy:
+         return len(self.uids) * expected / median(costs)
+ 
+     def observe_mtp(self, depth, accepted, milliseconds, *, stable):
+-        for position in range(depth):
++        # Prompt-lookup drafts (recipe p2_lookup) can verify more tokens than the
++        # MTP depth; only MTP positions carry an acceptance estimate. Unguarded, a
++        # batched cycle with a long lookup draft raised IndexError and aborted every
++        # in-flight stream (lane, 2026-09-29).
++        for position in range(min(depth, len(self.acceptance))):
+             reached = sum(count >= position for count in accepted)
+             if not reached:
+                 break
 diff --git a/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py b/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py
 index dcb7a318..6e4fb0ca 100644
 --- a/omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py
