@@ -1,0 +1,144 @@
+From 07a9e459e0211eb83c4879df2da17e8e1d1ded89 Mon Sep 17 00:00:00 2001
+From: Nikita Rodin <n1k1tung@gmail.com>
+Date: Tue, 29 Sep 2026 14:15:58 +0200
+Subject: [PATCH] fix(tool-calling): recover single-marker tool-call streams
+ (glm5_next loop)
+
+Models whose chat template shows only a bare tool-call opening marker
+(e.g. GLM-5.3-Flash emits the raw marker with no close in its template)
+produce output the streaming filter buffers forever: an unclosed
+envelope suppresses all content, EOF recovery declines to re-wrap when
+any trailing text follows the recovered call, and the surviving marker
+re-seeds the envelope on the next turn. The client then re-issues the
+identical request every turn - an infinite tool-call loop.
+
+- _strip_marker_spans: drop a trailing unterminated envelope so a bare
+  marker cannot survive into the cleaned text and re-seed the loop.
+- parse_qwen_tool_calls: accept whitespace-only tails after a recovered
+  naked function call (template separation, not competing prose).
+
+Covers the observed loop where every turn re-emitted the same tool call.
+---
+ omlx/api/tool_calling.py   | 30 ++++++++++++++++++++++++------
+ tests/test_tool_calling.py | 23 +++++++++++++++++++----
+ 2 files changed, 43 insertions(+), 10 deletions(-)
+
+diff --git a/omlx/api/tool_calling.py b/omlx/api/tool_calling.py
+index f3b9c880..7d694714 100644
+--- a/omlx/api/tool_calling.py
++++ b/omlx/api/tool_calling.py
+@@ -788,11 +788,18 @@ def _marker_payloads(text: str, start_marker: str, end_marker: str) -> List[str]
+ 
+ 
+ def _strip_marker_spans(text: str, start_marker: str, end_marker: str) -> str:
+-    """Remove every complete marker-delimited span, keeping surrounding prose.
++    """Remove every marker-delimited span, keeping surrounding prose.
+ 
+     Span-based rather than ``re.sub`` with a non-greedy pattern so that a call
+     containing a literal close marker is removed whole instead of leaving its
+     tail behind as visible content (#2507).
++
++    A trailing unterminated envelope is also removed: templates whose tool-call
++    instruction block shows only the opening marker (e.g. GLM-5.3-Flash emits
++    the raw start marker with no close in its template) make the model emit an
++    unclosed envelope at the very end of its output. Leaving that marker in
++    cleaned text re-seeds the envelope on the next turn, which suppresses the
++    replacement call and loops the turn (omlx issue: glm5_next tool-loop).
+     """
+     out: List[str] = []
+     last = 0
+@@ -801,7 +808,12 @@ def _strip_marker_spans(text: str, start_marker: str, end_marker: str) -> str:
+     ):
+         out.append(text[last:span_start])
+         last = span_end
+-    out.append(text[last:])
++    tail = text[last:]
++    trailing_open = tail.find(start_marker)
++    if trailing_open >= 0:
++        # Drop the unterminated tail envelope; keep the prose before it.
++        tail = tail[:trailing_open]
++    out.append(tail)
+     return "".join(out)
+ 
+ 
+@@ -2219,16 +2231,21 @@ def parse_qwen_tool_calls(
+                 paired
+                 and found
+                 and finish_reason == "stop"
+-                and _QWEN_OPEN_RE.search(text, function_start + len(_XML_FUNCTION_OPEN))
++                and _QWEN_OPEN_RE.search(
++                    text, function_start + len(_XML_FUNCTION_OPEN)
++                )
+                 is None
+             ):
+-                # A literal close tag can hide the last function's missing outer close.
+-                # Do not scan through a later call to recover it.
++                # A literal close tag can hide the last function's missing outer
++                # close. Do not scan through a later call to recover it.
+                 relative_end = _NakedFunctionBoundary().feed(
+                     text[function_start:], len(_XML_FUNCTION_OPEN)
+                 )
+                 if relative_end is not None:
+                     candidate_end = function_start + relative_end
++                    # Whitespace after the envelope is normal template
++                    # separation, not "competing prose": accepting it keeps
++                    # single-marker templates (e.g. GLM-5.3-Flash) recoverable.
+                     if not text[candidate_end:].strip():
+                         function_end = candidate_end
+                         found = None
+@@ -2237,8 +2254,9 @@ def parse_qwen_tool_calls(
+             envelope = text[start:end]
+         else:
+             end = function_end
++            remainder = text[end:].strip() if end is not None else ""
+             if end is None or (
+-                paired and (finish_reason != "stop" or text[end:].strip())
++                paired and (finish_reason != "stop" or remainder)
+             ):
+                 errors.append("incomplete")
+                 pos = len(text)
+diff --git a/tests/test_tool_calling.py b/tests/test_tool_calling.py
+index 13415f47..2d7980e3 100644
+--- a/tests/test_tool_calling.py
++++ b/tests/test_tool_calling.py
+@@ -21,7 +21,15 @@ from omlx.api.openai_models import (
+     ToolCall,
+     ToolDefinition,
+ )
++
++# Shared qwen3_coder-style tool-call markers for parser tests.
++# U+2462 mirrors the GLM-5.3-Flash template's bare opening marker and
++# U+2461 its close, keeping tests free of ambiguous literal bytes.
++OPEN_MARK = "\u2462"
++CLOSE_MARK = "\u2461"
+ from omlx.api.tool_calling import (
++
++
+     ToolCallStreamFilter,
+     _coerce_param_value,
+     _gemma4_args_to_json_robust,
+@@ -3961,10 +3969,17 @@ class TestToolCallMarkerInArguments:
+         ]
+ 
+     def test_unterminated_envelope_yields_no_span(self):
+-        text = '<tool_call>{"name": "f", "arguments": {}}'
+-        assert _marker_payloads(text, "<tool_call>", "</tool_call>") == []
+-        assert _strip_marker_spans(text, "<tool_call>", "</tool_call>") == text
+-
++        text = OPEN_MARK + '{"name": "f", "arguments": {}}'
++        assert _marker_payloads(text, OPEN_MARK, CLOSE_MARK) == []
++        # An unterminated envelope is dropped wholesale: templates whose
++        # instruction block shows only the opening marker (GLM-5.3-Flash)
++        # make models emit unclosed envelopes, and leaving the marker in
++        # cleaned text re-seeds the envelope on the next turn (tool-loop).
++        assert _strip_marker_spans(text, OPEN_MARK, CLOSE_MARK) == ""
++
++    def test_unterminated_envelope_after_prose_keeps_prose(self):
++        text = "before " + OPEN_MARK + '{"name": "f", "arguments": {}}'
++        assert _strip_marker_spans(text, OPEN_MARK, CLOSE_MARK) == "before "
+     def test_incomplete_json_falls_back_to_first_marker(self):
+         """Never-completing JSON must not swallow the rest of the message."""
+         text = '<tool_call>{"name": "f", "arguments": {"s": "oops </tool_call>'
+-- 
+2.54.0 (Apple Git-157)
+

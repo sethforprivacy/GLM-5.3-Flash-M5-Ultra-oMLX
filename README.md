@@ -10,7 +10,8 @@ Companion recipe: [Qwen3.8-Flash-Next on the same machine](https://github.com/se
 
 ## Two profiles
 
-- **Recommended: oMLX `main` built from source** (@ 65515c3c), in two layers:
+- **Recommended: oMLX `main` built from source** (@ a4048eef), in three layers:
+  - open upstream PR [#4086](https://github.com/jundot/omlx/pull/4086) (N1k1tung): stops GLM-5.3's unterminated tool-call marker from looping in long agent sessions;
   - this recipe's patch: prompt-lookup MTP drafts and the batched HC mix for 2+ streams;
   - the MTP graft and the official template.
 
@@ -104,7 +105,8 @@ Plan for about 200 GB of disk (the ~182 GB backbone plus 8.6 GB of graft source)
 - **Stop token:** the model sometimes emits `<|assistant|>` plus extra text after an answer, with or without this recipe (checkpoint template).
 - **Concurrency:** prompt lookup and the fused decode kernels are single-stream. 2+ streams run the batched path, 79–115 tok/s aggregate.
 - **Greedy text** is not byte-identical to plain decoding, with or without this recipe, because multi-row MTP verify rounds differently.
-- **The recommended profile builds on a pinned oMLX `main` commit** (65515c3c), not a release. All the upstream GLM-5.3 PRs it uses are merged; the recipe will move to the first oMLX release that contains them.
+- **The recommended profile builds on a pinned oMLX `main` commit** (a4048eef), not a release, plus one open PR (#4086, a tool-call parsing fix). All the upstream GLM-5.3 performance PRs it uses are merged; the recipe will move to the first oMLX release that contains them.
+- **Installing oMLX `main` with pip:** since the mlx-lm bump in `main` (#4108), `pip install --no-build-isolation -e .` builds mlx-lm without setuptools-scm, as version 0.0.0 with no `_version.py`. That causes a dependency conflict with dflash-mlx, and then an ImportError at startup. `scripts/install.sh` installs `setuptools-scm` first.
 - **Long contexts:** one 512K-token request works (prefill 1,684 tok/s at 512K, 33 tok/s decode at that depth, 470K-token recall passes, peak RAM 227 GB).
   Several long requests at once can briefly spike memory when they join one batch: 4 × 125K concurrent reached 260 GB of system RAM (above the 240 GiB Metal limit) for a few seconds, while 2 × 250K was fine.
   If you serve long contexts to several clients, cap the context per request (`max_context_window` in the per-model settings) and keep the combined live context well under ~400K tokens.

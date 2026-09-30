@@ -104,6 +104,19 @@ KLD with the new decode and prefill paths: teacher-forced 0.0345 / top-1 0.9419,
    - **TF32 off:** with MLX TF32 off, stock `main` and v3 are identical (decode-path 0.0482, teacher-forced 0.0345), so #3983's exact-fp32 HC mix matches exact-fp32 stock.
    - **Toggles:** decode fusion, gate/up fusion, the P×V split and the NAX indexer each leave KLD bit-identical.
 
+## 2026-09-30: recommended profile on oMLX `main` @ a4048eef (+ #4086 + recipe patch), from scratch
+
+- **Build:** `scripts/install.sh` into a fresh tree, identical to the development branch (`glm-v6`); every native kernel loads; mlx-lm reports 0.31.4.dev132+g94cdcae13.
+- **Tests:** GLM set (glm|kda|layer_pipeline|dsa|sparse_mla|hc_prefill|moe_gate|gather_qmm) plus `tests/test_tool_calling.py`: **1,479 passed, 1 skipped**.
+- **Cell (back-to-back with the 09-29 build, same morning):**
+  - prefill 1,975 · 2,215 · 2,259 · 2,149 · 2,024 tok/s at 2K–256K (09-29 build: 1,979 · 2,259 · 2,222 · 2,180 · 2,023); ladder 82.6 · 77.4 · 100.6 · 112.9 (82.7 · 78.3 · 100.4 · 115.1);
+  - reasoning 12/12, all qualify gates pass (vision, tool, 127K).
+- **ABBA repeat** (decode + 32K/128K prefill, A = 09-29 build, B = this build): fresh decode A 80.34 / 80.39, B 80.44 / 80.33; code 2K A 76.96 / 76.91, B 76.90 / 75.28; prefill 32K A 2,223 / 2,217, B 2,263 / 2,262; 128K A 2,164 / 2,178, B 2,184 / 2,178. Parity.
+- **Agent mix, T=0:** edit 141.6 · JSON 143.4 · fix 132.7 · diff 72.2 · prose 62.0 · new code 80.7 (09-29 build same morning: 142.7 · 144.2 · 132.4 · 72.2 · 62.0 · 80.7).
+- **KLD:** teacher-forced 0.0361 / top-1 0.9405, decode-path 0.0482 / 0.9229: identical.
+- **Not adopted, #4112** (jerryfane, head 276097ab; shared-MTP parking + batched priming folds): `BatchPolicy(fixed=True)` never parks, so it does nothing at fixed depth 2. At adaptive depth, B vs C (= B + #4112) same build: 8 streams 121.1 → 127.9.
+  Against this recipe's fixed depth 2, a BCCB repeat (B fixed / C adaptive) gives 8 streams 113.9 vs 125.1 (+10 %) but 4 streams 101.1 vs 96.3 (−5 %), code 2K 76.96 vs 73.8 (−4 %), fresh decode and agent turns flat. A trade, so fixed depth 2 stays.
+
 ## 2026-09-29: recommended profile on oMLX `main` @ 65515c3c (+ recipe patch), from scratch
 
 - **Build:** `scripts/install.sh` into a fresh tree, identical to the development branch (`glm-v5`); every native kernel loads.

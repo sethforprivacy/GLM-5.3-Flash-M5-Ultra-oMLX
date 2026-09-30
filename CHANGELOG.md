@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-09-30: recommended profile on oMLX `main` @ a4048eef + #4086
+
+- oMLX `main` moved to a4048eef. For GLM-5.3 this picks up #4098 (indexer selection parity when the native top-k kernel is missing; unchanged where it is present, as on M5) and the mlx-lm bump to 94cdcae with ported top_p/XTC sampler fixes (#4108).
+- New: open upstream PR [#4086](https://github.com/jundot/omlx/pull/4086) (N1k1tung, head 07a9e459) as `patches/upstream-omlx-4086-glm-toolcall-loop.patch`. It stops GLM-5.3's bare tool-call opening marker from looping: an unterminated envelope used to suppress content and re-seed the same tool call every turn in long agent sessions.
+- `scripts/install.sh` installs `setuptools-scm` before the no-build-isolation kernel build. Without it, current `main`'s mlx-lm git pin builds as 0.0.0 with no `_version.py`.
+- Validated from scratch: 1,479 tests pass (GLM set + tool calling); performance at parity with the 09-29 build in an ABBA repeat (fresh decode 80.39 vs 80.37, 32K prefill 2,263 vs 2,220, 128K 2,181 vs 2,171); 12/12 and all gates including vision; KLD identical (0.0361 / 0.0482).
+- Tested and not adopted: #4112 (shared-MTP parking). It is inert at this recipe's fixed MTP depth 2. At adaptive depth it gives +10 % at 8 streams but −5 % at 4 streams and −4 % on single-stream code against fixed depth 2 ([VALIDATION](docs/VALIDATION.md)).
+
 ## 2026-09-29 (afternoon): fix `IndexError: list index out of range` under concurrent requests
 
 - **Symptom:** with two or more requests decoding at once (e.g. an agent client running parallel subagents), clients got `list index out of range` and aborted streams.

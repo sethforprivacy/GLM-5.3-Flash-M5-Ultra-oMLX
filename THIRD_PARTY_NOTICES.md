@@ -20,7 +20,8 @@ Every change is marked in-code with a "Phase-2" / "p2" comment and sits behind a
 
 ## Upstream oMLX code (Apache-2.0)
 
-The recommended profile builds oMLX `main` @ 65515c3c unmodified except for `patches/omlx-main-glm-on-stack.patch` (this recipe's changes, marked in the files).
+The recommended profile builds oMLX `main` @ a4048eef unmodified except for `patches/omlx-main-glm-on-stack.patch` (this recipe's changes, marked in the files) and `patches/upstream-omlx-4086-glm-toolcall-loop.patch`.
+That second patch is open oMLX PR #4086 by Nikita Rodin (N1k1tung), head 07a9e459, unmodified (`git format-patch` output, author and message kept), Apache-2.0 like the rest of oMLX. It touches `omlx/api/tool_calling.py` and `tests/test_tool_calling.py`.
 jonathan308's GLM-5.3 PRs, including #4026 (previously shipped here as a pinned patch), are part of that upstream commit, not redistributed separately.
 
 ## Ideas credited, no code copied
